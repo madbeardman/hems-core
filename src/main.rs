@@ -1,13 +1,27 @@
+mod api;
+mod config;
+
 use axum::{Router, routing::get};
+use config::Config;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = Router::new().route("/", get(|| async { "HEMS-Core is running!" }));
+    let config = Config::from_env();
 
-    let listener = TcpListener::bind("127.0.0.1:3001").await?;
+    let app = Router::new()
+        .route("/", get(|| async { "HEMS-Core is running!" }))
+        .nest("/api", api::router());
 
-    println!("HEMS-Core listening on http://127.0.0.1:3001");
+    let address = format!("{}:{}", config.host, config.port);
+
+    let listener = TcpListener::bind(&address).await?;
+
+    println!(
+        "HEMS-Core v{} listening on http://{}",
+        env!("CARGO_PKG_VERSION"),
+        address
+    );
 
     axum::serve(listener, app).await?;
 
