@@ -1,17 +1,27 @@
 mod api;
 mod config;
+mod home_assistant;
 
 use axum::{Router, routing::get};
 use config::Config;
 use tokio::net::TcpListener;
 
+use api::AppState;
+use home_assistant::HomeAssistantClient;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env();
+    dotenvy::dotenv().ok();
+
+    let config = Config::from_env()?;
+
+    let ha = HomeAssistantClient::new(config.ha_url, config.ha_token)?;
+
+    let state = AppState { ha };
 
     let app = Router::new()
         .route("/", get(|| async { "HEMS-Core is running!" }))
-        .nest("/api", api::router());
+        .nest("/api", api::router(state));
 
     let address = format!("{}:{}", config.host, config.port);
 
