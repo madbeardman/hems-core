@@ -3,3 +3,5 @@
 !.env.example
 /target
 *.local.json
+.DS_Store
+System.md
