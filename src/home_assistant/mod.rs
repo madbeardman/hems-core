@@ -6,9 +6,9 @@ use std::time::Duration;
 pub struct EntityState {
     state: String,
     pub last_updated: chrono::DateTime<chrono::Utc>,
-    last_changed: chrono::DateTime<chrono::Utc>,
+    pub last_changed: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
-    last_reported: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_reported: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub attributes: serde_json::Value,
 }
@@ -34,28 +34,32 @@ impl HomeAssistantClient {
         })
     }
 
-    pub async fn get_numeric_state(
+    pub async fn battery_snapshot(
         &self,
-        entity_id: &str,
-    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut r = self.reading(entity_id).await?;
-        if entity_id.ends_with("_soc") {
-            if r.unit.as_deref() != Some("%") || !(0.0..=100.0).contains(&r.value) {
-                return Err("Invalid SOC".into());
-            }
-        } else {
-            match r.unit.as_deref() {
-                Some("W") => (),
-                Some("kW") => r.value *= 1000.0,
-                _ => return Err("Invalid battery power unit".into()),
-            }
-        }
-        if !r.value.is_finite() {
-            return Err("Invalid normalized battery power".into());
-        }
-        let value = r.value;
-
-        Ok(value)
+    ) -> Result<[f64; 3], Box<dyn std::error::Error + Send + Sync>> {
+        let read = async |id: &'static str| {
+            self.entity(id).await.map_err(|error| {
+                eprintln!(
+                    "Battery read failed: entity={id} reason={}",
+                    diagnostic_status(error.as_ref())
+                );
+                error
+            })
+        };
+        let (soc, charge, discharge) = tokio::try_join!(
+            read("sensor.solis_s6_eh1p_battery_soc"),
+            read("sensor.solis_s6_eh1p_battery_charge_power"),
+            read("sensor.solis_s6_eh1p_battery_discharge_power"),
+        )?;
+        validate_battery_snapshot([&soc, &charge, &discharge], chrono::Utc::now()).map_err(
+            |error| {
+                eprintln!(
+                    "Battery snapshot rejected: reason={}",
+                    diagnostic_status(error.as_ref())
+                );
+                error
+            },
+        )
     }
 }
 
@@ -73,6 +77,8 @@ enum InvalidReading {
     Stale,
     Future,
     Invalid,
+    InvalidSoc,
+    InvalidUnit,
 }
 impl std::fmt::Display for InvalidReading {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,6 +89,8 @@ impl std::fmt::Display for InvalidReading {
                 Self::Stale => "stale",
                 Self::Future => "future_timestamp",
                 Self::Invalid => "invalid_state",
+                Self::InvalidSoc => "invalid_soc",
+                Self::InvalidUnit => "invalid_unit",
             }
         )
     }
@@ -95,18 +103,44 @@ pub fn reading_error_status(
         Some(InvalidReading::Stale) => "stale",
         Some(InvalidReading::Future) => "future_timestamp",
         Some(InvalidReading::Invalid) => "invalid_state",
+        Some(InvalidReading::InvalidSoc) => "invalid_soc",
+        Some(InvalidReading::InvalidUnit) => "invalid_unit",
         None => "upstream_error",
     }
 }
 
-fn validate(
+// Only allowlisted labels reach logs. reqwest error text can contain request URLs.
+pub fn diagnostic_status(error: &(dyn std::error::Error + Send + Sync + 'static)) -> &'static str {
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return match error.status().map(|status| status.as_u16()) {
+            Some(401 | 403) => "ha_auth_rejected",
+            Some(404) => "ha_entity_not_found",
+            Some(_) => "ha_http_error",
+            None if error.is_timeout() => "ha_timeout",
+            None if error.is_connect() => "ha_connection_failed",
+            None if error.is_decode() => "ha_invalid_response",
+            None => "ha_request_failed",
+        };
+    }
+    reading_error_status(error)
+}
+
+pub(crate) fn validate(
     entity: &EntityState,
     now: chrono::DateTime<chrono::Utc>,
     max_age: i64,
 ) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
+    validate_with_age(entity, now, Some(max_age))
+}
+
+fn validate_with_age(
+    entity: &EntityState,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: Option<i64>,
+) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
     let observed_at = entity.last_reported.unwrap_or(entity.last_updated);
     let age = now.signed_duration_since(observed_at);
-    if age > chrono::Duration::seconds(max_age) {
+    if max_age.is_some_and(|limit| age > chrono::Duration::seconds(limit)) {
         return Err(InvalidReading::Stale.into());
     }
     if age < -chrono::Duration::seconds(30) {
@@ -159,14 +193,106 @@ impl HomeAssistantClient {
         &self,
         id: &str,
     ) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
-        let entity = self.entity(id).await?;
-        validate(&entity, chrono::Utc::now(), 300)
+        self.reading_with_max_age(id, 300).await
     }
+
+    pub async fn reading_with_max_age(
+        &self,
+        id: &str,
+        max_age: i64,
+    ) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
+        let entity = self.entity(id).await?;
+        validate(&entity, chrono::Utc::now(), max_age)
+    }
+}
+
+// These three known entities belong to the same inverter. A recent report from
+// any member establishes group activity, not independent measurement freshness.
+fn validate_battery_snapshot(
+    entities: [&EntityState; 3],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<[f64; 3], Box<dyn std::error::Error + Send + Sync>> {
+    let mut values = [0.0; 3];
+    let mut active = false;
+    for (index, entity) in entities.into_iter().enumerate() {
+        let r = validate_with_age(entity, now, None)?;
+        active |= now.signed_duration_since(r.observed_at) <= chrono::Duration::seconds(300);
+        values[index] = match (index, r.unit.as_deref()) {
+            (0, Some("%")) if (0.0..=100.0).contains(&r.value) => r.value,
+            (0, _) => return Err(InvalidReading::InvalidSoc.into()),
+            (_, Some("W")) => r.value,
+            (_, Some("kW")) => r.value * 1000.0,
+            _ => return Err(InvalidReading::InvalidUnit.into()),
+        };
+        if !values[index].is_finite() || values[index] < 0.0 {
+            return Err(InvalidReading::Invalid.into());
+        }
+    }
+    if !active {
+        return Err(InvalidReading::Stale.into());
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn battery_group_allows_unchanged_values_but_requires_recent_activity() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        let make = |value: &str, unit: &str, time| EntityState {
+            state: value.into(),
+            attributes: serde_json::json!({"unit_of_measurement":unit}),
+            last_changed: time,
+            last_updated: time,
+            last_reported: Some(time),
+        };
+        let mut soc = make("99", "%", old);
+        let mut charge = make("0.978", "kW", now);
+        let mut discharge = make("0", "W", old);
+        assert_eq!(
+            validate_battery_snapshot([&soc, &charge, &discharge], now).unwrap(),
+            [99.0, 978.0, 0.0]
+        );
+        assert!(validate(&discharge, now, 300).is_err()); // Other telemetry stays strict.
+        charge.last_reported = Some(old);
+        charge.last_updated = old;
+        charge.last_changed = old;
+        let error = validate_battery_snapshot([&soc, &charge, &discharge], now).unwrap_err();
+        assert_eq!(diagnostic_status(error.as_ref()), "stale");
+        charge.last_reported = Some(now);
+        for bad in ["unavailable", "unknown", "NaN", "-1"] {
+            discharge.state = bad.into();
+            assert!(validate_battery_snapshot([&soc, &charge, &discharge], now).is_err());
+        }
+        discharge.state = "0".into();
+        discharge.last_reported = Some(now + chrono::Duration::seconds(31));
+        assert!(validate_battery_snapshot([&soc, &charge, &discharge], now).is_err());
+        discharge.last_reported = Some(old);
+        discharge.attributes["unit_of_measurement"] = "kWh".into();
+        assert!(validate_battery_snapshot([&soc, &charge, &discharge], now).is_err());
+        discharge.attributes["unit_of_measurement"] = "W".into();
+        soc.state = "101".into();
+        assert!(validate_battery_snapshot([&soc, &charge, &discharge], now).is_err());
+    }
+
+    #[test]
+    fn diagnostics_use_allowlisted_labels() {
+        for (error, label) in [
+            (InvalidReading::Stale, "stale"),
+            (InvalidReading::Future, "future_timestamp"),
+            (InvalidReading::Invalid, "invalid_state"),
+            (InvalidReading::InvalidUnit, "invalid_unit"),
+            (InvalidReading::InvalidSoc, "invalid_soc"),
+        ] {
+            assert_eq!(diagnostic_status(&error), label);
+        }
+        let private_error: Box<dyn std::error::Error + Send + Sync> =
+            "private-token-and-url".into();
+        assert_eq!(diagnostic_status(private_error.as_ref()), "upstream_error");
+    }
+
     #[test]
     fn rejects_stale_future_and_invalid_states() {
         let now = chrono::Utc::now();
