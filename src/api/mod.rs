@@ -26,6 +26,7 @@ struct BatteryResponse {
     soc_percent: f64,
     charge_power_w: f64,
     discharge_power_w: f64,
+    freshness: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -50,7 +51,7 @@ async fn version() -> Json<VersionResponse> {
 async fn battery(
     State(state): State<AppState>,
 ) -> Result<Json<BatteryResponse>, (StatusCode, Json<ApiError>)> {
-    let [soc, charge, discharge] = state.ha.battery_snapshot().await.map_err(|_| {
+    let snapshot = state.ha.battery_snapshot().await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
@@ -59,6 +60,7 @@ async fn battery(
         )
     })?;
 
+    let [soc, charge, discharge] = snapshot.values;
     if !(0.0..=100.0).contains(&soc) || charge < 0.0 || discharge < 0.0 {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -72,6 +74,7 @@ async fn battery(
         soc_percent: soc,
         charge_power_w: charge,
         discharge_power_w: discharge,
+        freshness: snapshot.freshness,
     }))
 }
 
@@ -906,9 +909,15 @@ mod http_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(
-            body,
+            serde_json::json!({"soc_percent":body["soc_percent"],"charge_power_w":body["charge_power_w"],"discharge_power_w":body["discharge_power_w"]}),
             serde_json::json!({"soc_percent":55.0,"charge_power_w":2000.0,"discharge_power_w":2000.0})
         );
+        assert_eq!(body["freshness"]["all_sources_recent"], true);
+        assert_eq!(
+            body["freshness"]["sources"]["soc_percent"]["status"],
+            "fresh"
+        );
+        assert!(body["freshness"]["sources"]["discharge_power_w"]["last_reported"].is_string());
         task.abort();
         ha_task.abort();
     }

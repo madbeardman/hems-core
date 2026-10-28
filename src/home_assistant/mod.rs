@@ -36,7 +36,7 @@ impl HomeAssistantClient {
 
     pub async fn battery_snapshot(
         &self,
-    ) -> Result<[f64; 3], Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BatterySnapshot, Box<dyn std::error::Error + Send + Sync>> {
         let read = async |id: &'static str| {
             self.entity(id).await.map_err(|error| {
                 eprintln!(
@@ -51,7 +51,7 @@ impl HomeAssistantClient {
             read("sensor.solis_s6_eh1p_battery_charge_power"),
             read("sensor.solis_s6_eh1p_battery_discharge_power"),
         )?;
-        validate_battery_snapshot([&soc, &charge, &discharge], chrono::Utc::now()).map_err(
+        battery_snapshot_with_metadata([&soc, &charge, &discharge], chrono::Utc::now()).map_err(
             |error| {
                 eprintln!(
                     "Battery snapshot rejected: reason={}",
@@ -61,6 +61,52 @@ impl HomeAssistantClient {
             },
         )
     }
+}
+
+pub struct BatterySnapshot {
+    pub values: [f64; 3],
+    pub freshness: serde_json::Value,
+}
+
+fn battery_snapshot_with_metadata(
+    entities: [&EntityState; 3],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<BatterySnapshot, Box<dyn std::error::Error + Send + Sync>> {
+    let values = validate_battery_snapshot(entities, now)?;
+    let mut sources = serde_json::Map::new();
+    let ids = [
+        "sensor.solis_s6_eh1p_battery_soc",
+        "sensor.solis_s6_eh1p_battery_charge_power",
+        "sensor.solis_s6_eh1p_battery_discharge_power",
+    ];
+    let names = ["soc_percent", "charge_power_w", "discharge_power_w"];
+    let mut all_fresh = true;
+    for (index, entity) in entities.into_iter().enumerate() {
+        let observed_at = entity.last_reported.unwrap_or(entity.last_updated);
+        let age = now.signed_duration_since(observed_at);
+        let fresh = age <= chrono::Duration::seconds(300);
+        all_fresh &= fresh;
+        let status = if age < chrono::Duration::zero() {
+            "future_within_tolerance"
+        } else if fresh {
+            "fresh"
+        } else {
+            "older_report_accepted_via_group"
+        };
+        sources.insert(names[index].into(),serde_json::json!({
+            "entity_id":ids[index],"status":status,"age_seconds":age.num_milliseconds() as f64 / 1000.0,
+            "last_changed":entity.last_changed,"last_updated":entity.last_updated,"last_reported":entity.last_reported,
+            "observed_at":observed_at,"observed_at_source":if entity.last_reported.is_some() {"last_reported"} else {"last_updated"},
+        }));
+    }
+    Ok(BatterySnapshot {
+        values,
+        freshness: serde_json::json!({
+            "fetched_at":now,"status":"recent_group_activity","policy":"at_least_one_recent_inverter_report",
+            "max_age_seconds":300,"future_tolerance_seconds":30,"all_sources_recent":all_fresh,"sources":sources,
+            "timestamp_basis":"Home Assistant reports; not independent device measurement timestamps",
+        }),
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -237,6 +283,49 @@ fn validate_battery_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn battery_metadata_preserves_old_reports_and_timestamp_fallback() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        let make = |state: &str, unit: &str, time, reported| EntityState {
+            state: state.into(),
+            attributes: serde_json::json!({"unit_of_measurement":unit}),
+            last_changed: time,
+            last_updated: time,
+            last_reported: reported,
+        };
+        let soc = make("99", "%", old, None);
+        let charge = make("0.978", "kW", now, Some(now));
+        let discharge = make("0", "W", old, Some(old));
+        let snapshot = battery_snapshot_with_metadata([&soc, &charge, &discharge], now).unwrap();
+        assert_eq!(snapshot.values, [99.0, 978.0, 0.0]);
+        let meta = snapshot.freshness;
+        assert_eq!(meta["fetched_at"], serde_json::json!(now));
+        assert_eq!(meta["all_sources_recent"], false);
+        assert_eq!(meta["sources"]["charge_power_w"]["status"], "fresh");
+        assert_eq!(
+            meta["sources"]["discharge_power_w"]["status"],
+            "older_report_accepted_via_group"
+        );
+        assert_eq!(
+            meta["sources"]["discharge_power_w"]["observed_at"],
+            serde_json::json!(old)
+        );
+        assert_eq!(meta["sources"]["discharge_power_w"]["age_seconds"], 3600.0);
+        assert!(meta["sources"]["soc_percent"]["last_reported"].is_null());
+        assert_eq!(
+            meta["sources"]["soc_percent"]["observed_at_source"],
+            "last_updated"
+        );
+        assert!(
+            battery_snapshot_with_metadata(
+                [&soc, &charge, &discharge],
+                now + chrono::Duration::seconds(301)
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn battery_group_allows_unchanged_values_but_requires_recent_activity() {
         let now = chrono::Utc::now();
