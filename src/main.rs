@@ -1,8 +1,9 @@
 mod api;
 mod config;
+mod frontend;
 mod home_assistant;
 
-use axum::{Router, routing::get};
+use axum::Router;
 use config::Config;
 use tokio::net::TcpListener;
 
@@ -23,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = Router::new()
-        .route("/", get(|| async { "HEMS-Core is running!" }))
+        .merge(frontend::router())
         .nest("/api", api::router(state));
 
     let address = format!("{}:{}", config.host, config.port);
