@@ -17,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ha = HomeAssistantClient::new(config.ha_url, config.ha_token)?;
 
-    let state = AppState { ha };
+    let state = AppState {
+        ha,
+        collection: api::CollectionConfig::from_env()?,
+    };
 
     let app = Router::new()
         .route("/", get(|| async { "HEMS-Core is running!" }))
