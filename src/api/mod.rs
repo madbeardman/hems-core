@@ -428,20 +428,24 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
             entry["battery_discharge_included"] = true.into();
             entry["ac_charging_sign_confirmed"] = true.into();
         }
+        if name == "household" && !id.is_empty() {
+            entry["basis"] = "configured household-load sensor via Home Assistant".into();
+        }
         result.insert(name.into(), entry);
     }
     let assumed_solar_inputs = apply_solar_zero_policy(&mut result);
     derive_stale_grid_directions(&mut result);
-    // Preserve an explicitly configured direct household sensor. Otherwise use
-    // the user-confirmed AC balance; DC PV and battery flows are excluded.
+    let calculated_household = household_balance(&result);
+    result.insert("household_ac_balance".into(), calculated_household.clone());
+    // Prefer the configured meter-backed household source. Keep the independent
+    // AC balance available for comparison even when that source is unavailable.
     if state
         .collection
         .sources
         .get("household")
         .is_none_or(|id| id.is_empty())
     {
-        let household = household_balance(&result);
-        result.insert("household".into(), household);
+        result.insert("household".into(), calculated_household);
     }
     // Numeric zero fallback is explicit in quality metadata, not a fresh reading.
     let confirmed = state.collection.pv_confirmed;
@@ -1002,6 +1006,55 @@ mod http_tests {
             prices(State(state)).await.0["next_day"]["status"],
             "duplicate_entity"
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_household_sensor_is_primary_and_ac_balance_stays_separate() {
+        let now = chrono::Utc::now();
+        let mock=Router::new().route("/api/states/{id}",get(move |axum::extract::Path(id):axum::extract::Path<String>|async move {
+            if id=="sensor.fixture_unavailable" { return (StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({}))); }
+            let value=match id.as_str() {
+                "sensor.solis_s6_eh1p_grid_power_net"=>"-78",
+                "sensor.solis_s6_gr1p_active_power"=>"20",
+                "sensor.solis_s6_eh1p_active_power"=>"250",
+                _=>"192",
+            };
+            (StatusCode::OK,Json(serde_json::json!({"state":value,"attributes":{"unit_of_measurement":"W"},
+                "last_changed":now,"last_updated":now,"last_reported":now})))
+        }));
+        let (url, task) = serve(mock).await;
+        let mut sources: std::collections::HashMap<_, _> = HOUSEHOLD_AC_INPUTS
+            .iter()
+            .map(|(name, id)| (*name, (*id).to_string()))
+            .collect();
+        sources.insert(
+            "household",
+            "sensor.solis_s6_eh1p_household_load_power".into(),
+        );
+        let mut state = AppState {
+            ha: HomeAssistantClient::new(url, "test".into()).unwrap(),
+            collection: CollectionConfig {
+                sources,
+                rates_entity: String::new(),
+                next_day_rates_entity: String::new(),
+                pv_confirmed: false,
+                forecast_entities: Vec::new(),
+                forecast_confirmed: false,
+            },
+        };
+        let data = energy(State(state.clone())).await.0;
+        assert_eq!(data["household"]["status"], "valid");
+        assert_eq!(data["household"]["reading"]["value"], 192.0);
+        assert_eq!(data["household_ac_balance"]["status"], "derived");
+        assert_eq!(data["household_ac_balance"]["reading"]["value"], 192.0);
+        state
+            .collection
+            .sources
+            .insert("household", "sensor.fixture_unavailable".into());
+        let data = energy(State(state)).await.0;
+        assert_eq!(data["household"]["status"], "upstream_error");
+        assert_eq!(data["household_ac_balance"]["reading"]["value"], 192.0);
         task.abort();
     }
 
