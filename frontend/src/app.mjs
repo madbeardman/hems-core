@@ -1,4 +1,4 @@
-import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates } from './model.mjs';
+import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates, historySegments } from './model.mjs';
 const $ = id => document.getElementById(id);
 const put = (id, value) => { const node = $(id); if (node && node.textContent !== String(value)) node.textContent = value; };
 const make = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
@@ -149,3 +149,50 @@ for (const link of document.querySelectorAll('nav a')) link.addEventListener('cl
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { render(); refresh(); } });
 setInterval(() => { if (!document.hidden) { render(); refresh(); } }, 15000);
 render(); refresh(true);
+
+
+async function loadHistory() {
+  const button = $('history-load'); button.disabled = true;
+  put('history-note', 'Loading local history…');
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 10000);
+  const metric = $('history-metric').value;
+  const to = Math.floor(Date.now() / 1000), from = to - 86400;
+  try {
+    const fetchJSON = async path => { const r = await fetch(path, { signal: controller.signal }); if (!r.ok) throw new Error('History unavailable'); return r.json(); };
+    const [result, status] = await Promise.all([
+      fetchJSON(`/api/history/samples?metric=${encodeURIComponent(metric)}&from=${from}&to=${to}&limit=2000`),
+      fetchJSON('/api/history/status')
+    ]);
+    const rows = result.rows ?? [], segments = historySegments(rows, status.sample_interval_seconds);
+    const points = segments.flat(); const host = $('history-chart'); host.replaceChildren();
+    if (points.length) {
+      const width = 640, height = 230, left = 60, top = 15, plotW = 560, plotH = 165;
+      const min = Math.min(0, ...points.map(r => r.value)), max = Math.max(1, ...points.map(r => r.value));
+      const x = t => left + (t - from) / (to - from) * plotW;
+      const y = v => top + (max - v) / (max - min) * plotH;
+      const chart = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': `${$('history-metric').selectedOptions[0].text}: last 24 hours. Gaps exclude unavailable and assumed-zero readings. Exact recent values are in the table below.` });
+      for (const value of [min, (min + max) / 2, max]) {
+        chart.append(svgNode('line', { x1: left, x2: left + plotW, y1: y(value), y2: y(value), class: 'chart-grid' }));
+        const label = svgNode('text', { x: left - 8, y: y(value) + 5, 'text-anchor': 'end' }); label.textContent = Math.round(value); chart.append(label);
+      }
+      for (const part of segments) {
+        if (part.length === 1) chart.append(svgNode('circle', { cx: x(part[0].sampled_at), cy: y(part[0].value), r: 3, class: 'history-point' }));
+        else chart.append(svgNode('polyline', { points: part.map(r => `${x(r.sampled_at)},${y(r.value)}`).join(' '), class: 'history-line' }));
+      }
+      for (const t of [from, from + 43200, to]) { const label = svgNode('text', { x: x(t), y: 211, 'text-anchor': t === to ? 'end' : 'start' }); label.textContent = londonTime(t * 1000); chart.append(label); }
+      host.append(chart);
+    } else host.append(make('p', 'No plottable readings yet. Collection runs independently of this dashboard.', 'chart-empty'));
+    const tbody = $('history-body'); tbody.replaceChildren();
+    for (const r of rows.slice(-120).reverse()) {
+      const row = make('tr');
+      for (const value of [londonTime(r.sampled_at * 1000), finite(r.value) ? `${r.value.toFixed(1)} ${r.unit ?? ''}` : '—', humanStatus(r.status), londonTime(r.observed_at)]) row.append(make('td', value));
+      tbody.append(row);
+    }
+    put('history-note', `${rows.length} samples in the last 24 hours · ${status.retention_days} day retention · ${status.sample_interval_seconds}s sampling. ${result.truncated ? 'Result truncated; narrow the API time range. ' : ''}Assumed-zero and unavailable readings leave chart gaps. Calculated readings and battery values accepted through group activity retain their quality labels. Loaded ${londonTime(Date.now())}.`);
+  } catch {
+    $('history-chart').replaceChildren(); $('history-body').replaceChildren();
+    put('history-note', 'History could not be loaded. Try again; live readings remain available.');
+  } finally { clearTimeout(timeout); button.disabled = false; }
+}
+$('history-load').addEventListener('click', loadHistory);
+$('history-metric').addEventListener('change', loadHistory);

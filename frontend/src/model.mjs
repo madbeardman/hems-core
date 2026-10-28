@@ -61,3 +61,19 @@ export const londonTime = value => {
   const date = new Date(value);
   return Number.isFinite(date.valueOf()) ? new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }).format(date) : '—';
 };
+
+// Gaps and assumptions must not become lines through invented measurements.
+export function historySegments(rows, intervalSeconds = 60) {
+  const accepted = new Set(['valid', 'fresh', 'derived', 'older_report_accepted_via_group', 'future_within_tolerance']);
+  const segments = []; let segment = []; let previous = null;
+  for (const row of rows ?? []) {
+    const valid = finite(row.value) && Number.isFinite(row.sampled_at) && accepted.has(row.status);
+    if (!valid || previous !== null && row.sampled_at - previous > intervalSeconds * 2) {
+      if (segment.length) segments.push(segment); segment = [];
+    }
+    if (valid) segment.push(row);
+    previous = row.sampled_at;
+  }
+  if (segment.length) segments.push(segment);
+  return segments;
+}

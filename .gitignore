@@ -5,3 +5,8 @@
 *.local.json
 .DS_Store
 System.md
+
+/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

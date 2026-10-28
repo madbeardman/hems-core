@@ -34,6 +34,23 @@ impl HomeAssistantClient {
         })
     }
 
+    pub async fn history_battery(&self) -> serde_json::Value {
+        let entities = tokio::try_join!(
+            self.entity("sensor.solis_s6_eh1p_battery_soc"),
+            self.entity("sensor.solis_s6_eh1p_battery_charge_power"),
+            self.entity("sensor.solis_s6_eh1p_battery_discharge_power"),
+        );
+        let now = chrono::Utc::now();
+        match entities {
+            Ok((soc, charge, discharge)) => {
+                battery_history_payload([&soc, &charge, &discharge], now)
+            }
+            Err(error) => {
+                serde_json::json!({"fetched_at":now,"status":diagnostic_status(error.as_ref())})
+            }
+        }
+    }
+
     pub async fn battery_snapshot(
         &self,
     ) -> Result<BatterySnapshot, Box<dyn std::error::Error + Send + Sync>> {
@@ -60,6 +77,28 @@ impl HomeAssistantClient {
                 error
             },
         )
+    }
+}
+
+fn battery_history_payload(
+    entities: [&EntityState; 3],
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    match battery_snapshot_with_metadata(entities, now) {
+        Ok(snapshot) => {
+            serde_json::json!({"soc_percent":snapshot.values[0],"charge_power_w":snapshot.values[1],"discharge_power_w":snapshot.values[2],"freshness":snapshot.freshness})
+        }
+        Err(error) => {
+            let status = diagnostic_status(error.as_ref());
+            let mut sources = serde_json::Map::new();
+            for (name, entity) in ["soc_percent", "charge_power_w", "discharge_power_w"]
+                .into_iter()
+                .zip(entities)
+            {
+                sources.insert(name.into(), serde_json::json!({"status":status,"last_updated":entity.last_updated,"last_changed":entity.last_changed,"last_reported":entity.last_reported,"observed_at":entity.last_reported.unwrap_or(entity.last_updated)}));
+            }
+            serde_json::json!({"status":status,"freshness":{"fetched_at":now,"status":status,"sources":sources,"timestamp_basis":"Home Assistant reports; not independent device measurement timestamps"}})
+        }
     }
 }
 
@@ -234,22 +273,6 @@ impl HomeAssistantClient {
             .json()
             .await?)
     }
-
-    pub async fn reading(
-        &self,
-        id: &str,
-    ) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
-        self.reading_with_max_age(id, 300).await
-    }
-
-    pub async fn reading_with_max_age(
-        &self,
-        id: &str,
-        max_age: i64,
-    ) -> Result<Reading, Box<dyn std::error::Error + Send + Sync>> {
-        let entity = self.entity(id).await?;
-        validate(&entity, chrono::Utc::now(), max_age)
-    }
 }
 
 // These three known entities belong to the same inverter. A recent report from
@@ -412,5 +435,33 @@ mod tests {
             attributes: serde_json::json!({}),
         };
         assert!(validate(&e, now, 300).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    #[test]
+    fn rejected_battery_history_retains_reports_without_republishing_values() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        let entity = |state: &str, unit: &str| EntityState {
+            state: state.into(),
+            attributes: serde_json::json!({"unit_of_measurement":unit}),
+            last_updated: old,
+            last_changed: old,
+            last_reported: Some(old),
+        };
+        let soc = entity("50", "%");
+        let charge = entity("0", "W");
+        let discharge = entity("20", "W");
+        let payload = battery_history_payload([&soc, &charge, &discharge], now);
+        assert_eq!(payload["status"], "stale");
+        assert!(payload["soc_percent"].is_null());
+        assert_eq!(
+            payload["freshness"]["sources"]["soc_percent"]["observed_at"],
+            serde_json::json!(old)
+        );
+        assert_eq!(payload["freshness"]["fetched_at"], serde_json::json!(now));
     }
 }

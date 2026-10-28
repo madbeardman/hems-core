@@ -401,7 +401,16 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
             if !seen.insert(id.clone()) {
                 entry["status"] = "duplicate_entity".into();
             } else {
-                match state.ha.reading(&id).await {
+                match state.ha.entity(&id).await.and_then(|entity| {
+                    entry["fetched_at"] = serde_json::json!(chrono::Utc::now());
+                    entry["source_timestamps"] = serde_json::json!({
+                        "last_updated":entity.last_updated,"last_changed":entity.last_changed,
+                        "last_reported":entity.last_reported,
+                        "observed_at":entity.last_reported.unwrap_or(entity.last_updated),
+                        "timestamp_basis":"Home Assistant reports, not independent device measurement timestamps"
+                    });
+                    crate::home_assistant::validate(&entity, chrono::Utc::now(), 300)
+                }) {
                     Ok(mut reading) => match normalize(
                         &mut reading,
                         unit,
@@ -411,7 +420,8 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
                             if name == "fit_pv" || name.starts_with("hybrid_pv_") {
                                 pv.push((reading.value, reading.observed_at));
                             }
-                            entry = serde_json::json!({"status": "valid", "entity_id": id, "reading": reading});
+                            entry["status"] = "valid".into();
+                            entry["reading"] = serde_json::to_value(reading).unwrap();
                         }
                         Err(reason) => entry["status"] = reason.into(),
                     },
@@ -482,6 +492,7 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
         "solar_forecast".into(),
         serde_json::json!({"endpoint":"/api/forecasts"}),
     );
+    result.insert("fetched_at".into(), serde_json::json!(chrono::Utc::now()));
     Json(serde_json::Value::Object(result))
 }
 
@@ -1164,6 +1175,7 @@ async fn forecasts(State(state): State<AppState>) -> Json<serde_json::Value> {
             match state.ha.entity(&id).await.and_then(|entity| {
                 // Preserve provenance even if validation rejects the value. These are
                 // HA state timestamps, not a provider forecast issuance timestamp.
+                entry["fetched_at"] = serde_json::json!(chrono::Utc::now());
                 entry["source_attributes"] = entity.attributes.clone();
                 entry["source_timestamps"] = serde_json::json!({
                     "last_changed":entity.last_changed,"last_updated":entity.last_updated,
@@ -1354,4 +1366,18 @@ mod forecast_tests {
             assert!(e["reading"].is_null());
         }
     }
+}
+
+// Reuse the same validation/provenance path for unattended collection.
+pub(crate) async fn history_energy(state: AppState) -> serde_json::Value {
+    energy(State(state)).await.0
+}
+pub(crate) async fn history_prices(state: AppState) -> serde_json::Value {
+    prices(State(state)).await.0
+}
+pub(crate) async fn history_forecasts(state: AppState) -> serde_json::Value {
+    forecasts(State(state)).await.0
+}
+pub(crate) async fn history_battery(state: AppState) -> serde_json::Value {
+    state.ha.history_battery().await
 }
