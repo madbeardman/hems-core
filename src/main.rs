@@ -4,6 +4,7 @@ mod costs;
 mod frontend;
 mod history;
 mod home_assistant;
+mod modelling;
 
 use axum::Router;
 use config::Config;
@@ -33,6 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cost_collector = costs::start(costs.clone(), history.clone(), stop_rx.clone());
     let collector = history::start(history.clone(), state.clone(), stop_rx);
     let app = Router::new()
+        .nest(
+            "/api/modelling",
+            modelling::router(
+                history.clone(),
+                modelling::Settings::from_env().map_err(|e| e.to_string())?,
+            ),
+        )
         .nest("/api/history", history::router(history))
         .merge(frontend::router())
         .nest("/api", api::router(state).merge(costs::router(costs)));
