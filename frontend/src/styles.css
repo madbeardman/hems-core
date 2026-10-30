@@ -8,3 +8,10 @@
 
 .costs-card { min-width: 0; }
 .costs-card table { font-size: .9em; }
+
+/* Keep modelling text legible on the small display; tables scroll within the card. */
+#modelling { margin-top: 20px; }
+#modelling p, #modelling button, #modelling details { margin-top: 14px; }
+#modelling table { font-size: 1rem; }
+#modelling td, #modelling th { white-space: normal; min-width: 7rem; }
+#modelling-result { overflow-wrap: anywhere; }

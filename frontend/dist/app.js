@@ -334,3 +334,34 @@ function costsRender(now) {
   }
   put('costs-quality', payload ? 'Totals include standing charges already. Both fuels must report today before a combined total is shown. Reports can be delayed or revised; this is not a final bill.' : 'Cost readings unavailable. Check the local Octopus sensor mappings.');
 }
+
+async function loadModelling() {
+ const button = $('modelling-load'); if (button.disabled || document.hidden) return;
+ button.disabled = true; button.setAttribute('aria-busy', 'true');
+ const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15000);
+ put('modelling-status', 'Reading saved history…');
+ try {
+  const response = await fetch('/api/modelling/summary', { signal: controller.signal });
+  if (!response.ok) throw new Error('unavailable');
+  const m = await response.json(); const host = $('modelling-result'); host.replaceChildren();
+  const num = (v, unit) => typeof v === 'number' && Number.isFinite(v) ? `${v.toFixed(unit === 'W' || unit === '%' ? 0 : 1)} ${unit}` : 'Insufficient data';
+  const b = m.battery;
+  host.append(make('p', `Capacity assumption ${num(b.assumed_usable_kwh, 'kWh')} usable; reserve ${num(b.reserve_percent, '%')}. Above reserve now: ${num(b.above_reserve_kwh, 'kWh')}.`));
+  host.append(make('p', `Observed active charge: ${num(b.charge.median_active_w, 'W')}; discharge: ${num(b.discharge.median_active_w, 'W')}. These are medians, not inverter limits.`));
+  host.append(make('p', b.efficiency_reason));
+  const table = make('table'); table.append(make('caption', 'Demand outlook · Europe/London · descriptive range'));
+  const head = make('thead'); const heading = make('tr'); for (const text of ['Start', 'Demand', 'Range', 'SOC scenario']) { const th = make('th', text); th.scope = 'col'; heading.append(th); } head.append(heading); table.append(head);
+  const body = make('tbody');
+  for (const p of m.predictions) { const row = make('tr'); for (const text of [p.local_start.slice(11, 16) + ' ' + p.local_start.slice(19), num(p.demand_w, 'W'), typeof p.low_w === 'number' ? `${num(p.low_w, 'W')} – ${num(p.high_w, 'W')}` : '—', num(p.soc_scenario_end_percent, '%')]) row.append(make('td', text)); body.append(row); }
+  table.append(body); const wrap = make('div', undefined, 'table-scroll'); wrap.append(table); host.append(wrap);
+  host.append(make('p', m.diagnostics.soc_scenario));
+  const details = make('details'); details.append(make('summary', 'Assumptions, coverage and solar comparisons'));
+  for (const [key, value] of Object.entries(m.diagnostics)) details.append(make('p', `${key.replaceAll('_', ' ')}: ${typeof value === 'object' ? JSON.stringify(value) : value}`));
+  for (const p of m.profiles) details.append(make('p', `${String(p.hour).padStart(2, '0')}:00 · ${p.period} · ${p.occupancy}: ${num(p.median_w, 'W')} median, ${p.days} qualifying days${p.ready ? '' : ' · insufficient days for prediction'}.`));
+  for (const s of m.solar_comparisons) details.append(make('p', `${s.day} · ${s.array} (${s.basis}): forecast ${num(s.forecast?.kwh, 'kWh')}; actual estimate ${num(s.actual_estimate_kwh, 'kWh')}; coverage ${s.coverage_percent}%. First seen: ${s.forecast?.first_seen ?? 'unavailable'}; provider issued: ${s.forecast?.provider_issued_at ?? 'unknown'}.`));
+  details.append(make('p', m.solar_comparisons[0]?.note ?? '')); host.append(details);
+  put('modelling-status', `Saved-history model as of ${londonTime(m.as_of)}. Load again to refresh; results cached for 60 seconds.`);
+ } catch { $('modelling-result').replaceChildren(); put('modelling-status', 'Modelling unavailable. Saved history may be busy; try again.'); }
+ finally { clearTimeout(timer); button.disabled = false; button.setAttribute('aria-busy', 'false'); }
+}
+$('modelling-load').addEventListener('click', loadModelling);
