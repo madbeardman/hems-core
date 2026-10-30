@@ -1,11 +1,11 @@
-import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates, historySegments } from './model.mjs';
+import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates, historySegments, costReading, todayCostTotal } from './model.mjs';
 const $ = id => document.getElementById(id);
 const put = (id, value) => { const node = $(id); if (node && node.textContent !== String(value)) node.textContent = value; };
 const make = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const SVG = 'http://www.w3.org/2000/svg';
 const svgNode = (tag, attrs = {}) => { const el = document.createElementNS(SVG, tag); for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value); return el; };
 const state = { records: {}, day: 'today', auto: true, busy: false, lastLive: null };
-const resources = { energy: 15000, battery: 15000, prices: 300000, forecasts: 300000, health: 60000, version: Infinity };
+const resources = { costs: 60000, energy: 15000, battery: 15000, prices: 300000, forecasts: 300000, health: 60000, version: Infinity };
 const data = key => state.records[key]?.error ? null : state.records[key]?.data;
 function pref(key, fallback) { try { return localStorage.getItem(`hems-${key}`) ?? fallback; } catch { return fallback; } }
 function save(key, value) { try { localStorage.setItem(`hems-${key}`, value); } catch { /* Display remains usable without storage. */ } }
@@ -13,8 +13,8 @@ function batteryRender(now) {
   const b = batteryView(data('battery'), now);
   put('battery-soc', b ? `${Math.round(b.soc)}%` : '—'); put('battery-state', b?.state ?? 'Unavailable');
   put('charge', power(b?.charge)); put('discharge', power(b?.discharge));
-  put('battery-quality', b ? b.older ? 'Some unchanged values have older reports; recent inverter activity is present.' : 'All battery sources reported recently.' : 'Battery reports unavailable or out of date.');
-  put('battery-freshness', b ? b.older ? 'Recent group activity' : 'Recent reports' : 'Unavailable');
+  put('battery-quality', b ? b.activityOnly ? 'Battery values have older HA reports; recent AC-power activity from the same inverter confirms group activity, not new battery measurements.' : b.older ? 'Some unchanged values have older reports; recent inverter activity is present.' : 'All battery sources reported recently.' : 'Battery reports unavailable or out of date.');
+  put('battery-freshness', b ? b.activityOnly ? 'Same-inverter activity' : b.older ? 'Recent group activity' : 'Recent reports' : 'Unavailable');
   const fill = $('battery-fill'); const height = b ? b.soc * .9 : 0;
   fill.setAttribute('height', height); fill.setAttribute('y', 101 - height);
   put('flow-battery', b ? `${b.state} · ${power(Math.max(b.charge, b.discharge))}` : 'Unavailable');
@@ -100,6 +100,8 @@ function diagnosticsRender() {
   const host = $('diagnostics-body'); host.replaceChildren(); const e = data('energy');
   const rows = [['FIT solar', e?.fit_pv], ['Hybrid PV 1', e?.hybrid_pv_1], ['Hybrid PV 2', e?.hybrid_pv_2], ['Household load', e?.household], ['Grid net', e?.grid_net], ['Hybrid AC', e?.hybrid_ac]];
   for (const [key, label] of [['soc_percent', 'Battery state of charge'], ['charge_power_w', 'Battery charge'], ['discharge_power_w', 'Battery discharge']]) { const source = data('battery')?.freshness?.sources?.[key]; rows.push([label, source ? { status: source.status, reading: source } : null]); }
+  const activity = data('battery')?.freshness?.activity_source;
+  if (activity) rows.push(['Hybrid inverter activity (battery group)', { status: activity.status, reading: activity }]);
   for (const [label, source] of rows) {
     const status = source?.status;
     const quality = ({ valid: 'Reported', derived: 'Calculated', fresh: 'Recent report', older_report_accepted_via_group: 'Older report · accepted via group', assumed_zero: `Assumed zero · ${humanStatus(source?.source_status).toLowerCase()}`, estimated_with_assumed_zero: 'Estimate · assumed solar zero', future_within_tolerance: 'Clock ahead · within tolerance' })[status] ?? humanStatus(status);
@@ -107,7 +109,7 @@ function diagnosticsRender() {
   }
 }
 function render() {
-  const now = Date.now(); batteryRender(now); energyRender(now); pricesRender(now); forecastsRender(now); diagnosticsRender();
+  const now = Date.now(); batteryRender(now); energyRender(now); pricesRender(now); forecastsRender(now); diagnosticsRender(); costsRender(now);
   const health = data('health'); const healthAge = now - (state.records.health?.lastSuccess ?? 0);
   const online = health?.status === 'healthy' && healthAge <= 120000;
   put('health', online ? 'HEMS Online' : 'Connection unavailable'); put('sidebar-status', online ? 'Service online' : 'Service unavailable');
@@ -196,3 +198,38 @@ async function loadHistory() {
 }
 $('history-load').addEventListener('click', loadHistory);
 $('history-metric').addEventListener('change', loadHistory);
+
+
+function costsRender(now) {
+  const payload = data('costs');
+  const money = value => finite(value) ? new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(value) : '—';
+  const dateLabel = value => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value ?? '')) return 'Date unavailable';
+    return new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short' }).format(new Date(`${value}T12:00:00Z`));
+  };
+  put('today-cost-total', money(todayCostTotal(payload, now)));
+  const body = $('costs-body'); body.replaceChildren();
+  for (const [fuel, label] of [['electricity', 'Electricity import'], ['gas', 'Gas']]) {
+    const cost = costReading(payload, `${fuel}_today_cost`, now), consumption = costReading(payload, `${fuel}_today_consumption`, now), standing = costReading(payload, `${fuel}_standing_charge`, now);
+    const row = make('tr'); row.append(make('th', label)); row.firstChild.scope = 'row';
+    for (const text of [money(cost?.value), consumption ? `${consumption.value.toFixed(3)} kWh${consumption.source_metadata?.is_estimated ? ' (estimated)' : ''}` : '—', money(standing?.value)]) row.append(make('td', text));
+    body.append(row);
+  }
+  const demand = costReading(payload, 'electricity_meter_demand', now);
+  put('meter-demand', demand ? `${power(demand.value)} · source report ${londonTime(demand.reading.observed_at)}` : 'Unavailable');
+  const previous = $('costs-previous'); previous.replaceChildren();
+  for (const [fuel, label] of [['electricity', 'Electricity'], ['gas', 'Gas']]) {
+    const cost = costReading(payload, `${fuel}_previous_cost`, now), consumption = costReading(payload, `${fuel}_previous_consumption`, now);
+    previous.append(make('p', `${label}: ${cost ? `${money(cost.value)} for ${dateLabel(cost.period_day)}${cost.status === 'delayed_period' ? ' · delayed report' : ''}` : 'Cost unavailable'}; ${consumption ? `${consumption.value.toFixed(3)} kWh for ${dateLabel(consumption.period_day)}${consumption.source_metadata?.is_estimated ? ' · estimated' : ''}` : 'consumption unavailable'}.`));
+  }
+  const reports = $('costs-reports'); reports.replaceChildren();
+  for (const [key, entry] of Object.entries(payload?.readings ?? {})) {
+    const day = entry.period_day ? ` · covers ${dateLabel(entry.period_day)}` : '';
+    const row = make('tr');
+    const stamp = Date.parse(entry.source_timestamps?.observed_at);
+    const report = Number.isFinite(stamp) ? new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', dateStyle: 'short', timeStyle: 'short' }).format(stamp) : '—';
+    for (const text of [key.replaceAll('_', ' '), `${entry.status?.replaceAll('_', ' ') ?? 'Unavailable'}${day}`, report]) row.append(make('td', text));
+    reports.append(row);
+  }
+  put('costs-quality', payload ? 'Totals include standing charges already. Both fuels must report today before a combined total is shown. Reports can be delayed or revised; this is not a final bill.' : 'Cost readings unavailable. Check the local Octopus sensor mappings.');
+}

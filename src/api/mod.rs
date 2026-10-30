@@ -1381,3 +1381,91 @@ pub(crate) async fn history_forecasts(state: AppState) -> serde_json::Value {
 pub(crate) async fn history_battery(state: AppState) -> serde_json::Value {
     state.ha.history_battery().await
 }
+
+#[cfg(test)]
+mod battery_activity_http_tests {
+    use super::*;
+    #[tokio::test]
+    async fn idle_battery_endpoint_and_history_use_the_same_explicit_activity_provenance() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let live = Arc::new(AtomicBool::new(true));
+        let live_flag = live.clone();
+        let old = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mock=Router::new().route("/api/states/{id}",get(move |axum::extract::Path(id):axum::extract::Path<String>| {
+            let live=live_flag.clone();
+            async move {
+                let activity=id=="sensor.solis_s6_eh1p_active_power";
+                let at=if activity {chrono::Utc::now()}else{old};
+                Json(serde_json::json!({"state":if activity&&!live.load(Ordering::SeqCst) {"unavailable"}else if id.ends_with("_soc") {"98"}else{"0"},"attributes":{"unit_of_measurement":if id.ends_with("_soc") {"%"}else{"W"}},"last_changed":at,"last_updated":at,"last_reported":at}))
+            }
+        }));
+        let (base, upstream) = super::http_tests::serve(mock).await;
+        let ha = HomeAssistantClient::new(base, "fixture".into()).unwrap();
+        let history = crate::history::History::open(crate::history::HistoryConfig {
+            path: ":memory:".into(),
+            interval: 60,
+            days: 30,
+        })
+        .unwrap();
+        let state = AppState {
+            ha: ha.clone(),
+            collection: CollectionConfig::from_env().unwrap(),
+        };
+        let (url, server) = super::http_tests::serve(
+            router(state).nest("/history", crate::history::router(history.clone())),
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let response = client.get(format!("{url}/battery")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["soc_percent"], 98.0);
+        assert_eq!(body["charge_power_w"], 0.0);
+        assert_eq!(body["discharge_power_w"], 0.0);
+        assert_eq!(
+            body["freshness"]["policy"],
+            "recent_confirmed_same_inverter_activity"
+        );
+        let payload = ha.history_battery().await;
+        assert_eq!(
+            payload["freshness"]["sources"]["soc_percent"]["observed_at"],
+            serde_json::json!(old)
+        );
+        history
+            .record("battery", payload, chrono::Utc::now())
+            .await
+            .unwrap();
+        let saved: serde_json::Value = client
+            .get(format!("{url}/history/samples?metric=soc_percent"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved["rows"][0]["status"],
+            "older_report_accepted_via_group"
+        );
+        assert_eq!(
+            saved["rows"][0]["provenance"]["freshness"]["activity_source"]["entity_id"],
+            "sensor.solis_s6_eh1p_active_power"
+        );
+        live.store(false, Ordering::SeqCst);
+        assert_eq!(
+            client
+                .get(format!("{url}/battery"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(ha.history_battery().await["soc_percent"].is_null());
+        upstream.abort();
+        server.abort();
+    }
+}

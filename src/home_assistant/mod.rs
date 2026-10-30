@@ -2,6 +2,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
+// Fixed, confirmed same-inverter source. A recent AC report establishes inverter
+// activity only; it is never a new battery measurement or a rewritten timestamp.
+const BATTERY_ACTIVITY_ENTITY: &str = "sensor.solis_s6_eh1p_active_power";
+type ReadError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(Debug, Deserialize)]
 pub struct EntityState {
     state: String,
@@ -34,16 +39,39 @@ impl HomeAssistantClient {
         })
     }
 
-    pub async fn history_battery(&self) -> serde_json::Value {
-        let entities = tokio::try_join!(
+    async fn battery_inputs(
+        &self,
+    ) -> Result<(EntityState, EntityState, EntityState, Option<EntityState>), ReadError> {
+        let (soc, charge, discharge) = tokio::try_join!(
             self.entity("sensor.solis_s6_eh1p_battery_soc"),
             self.entity("sensor.solis_s6_eh1p_battery_charge_power"),
             self.entity("sensor.solis_s6_eh1p_battery_discharge_power"),
-        );
+        )?;
+        // Extra read only when the battery group is otherwise valid but old.
+        // Invalid/unavailable battery states must never be rescued by activity.
+        let needs_activity =
+            validate_battery_snapshot([&soc, &charge, &discharge], chrono::Utc::now()).is_err_and(
+                |e| {
+                    matches!(
+                        e.downcast_ref::<InvalidReading>(),
+                        Some(InvalidReading::Stale)
+                    )
+                },
+            );
+        let activity = if needs_activity {
+            self.entity(BATTERY_ACTIVITY_ENTITY).await.ok()
+        } else {
+            None
+        };
+        Ok((soc, charge, discharge, activity))
+    }
+
+    pub async fn history_battery(&self) -> serde_json::Value {
+        let result = self.battery_inputs().await;
         let now = chrono::Utc::now();
-        match entities {
-            Ok((soc, charge, discharge)) => {
-                battery_history_payload([&soc, &charge, &discharge], now)
+        match result {
+            Ok((soc, charge, discharge, activity)) => {
+                battery_history_payload([&soc, &charge, &discharge], activity.as_ref(), now)
             }
             Err(error) => {
                 serde_json::json!({"fetched_at":now,"status":diagnostic_status(error.as_ref())})
@@ -51,40 +79,30 @@ impl HomeAssistantClient {
         }
     }
 
-    pub async fn battery_snapshot(
-        &self,
-    ) -> Result<BatterySnapshot, Box<dyn std::error::Error + Send + Sync>> {
-        let read = async |id: &'static str| {
-            self.entity(id).await.map_err(|error| {
-                eprintln!(
-                    "Battery read failed: entity={id} reason={}",
-                    diagnostic_status(error.as_ref())
-                );
-                error
-            })
+    pub async fn battery_snapshot(&self) -> Result<BatterySnapshot, ReadError> {
+        let result = match self.battery_inputs().await {
+            Ok((soc, charge, discharge, activity)) => battery_snapshot_with_activity(
+                [&soc, &charge, &discharge],
+                activity.as_ref(),
+                chrono::Utc::now(),
+            ),
+            Err(error) => Err(error),
         };
-        let (soc, charge, discharge) = tokio::try_join!(
-            read("sensor.solis_s6_eh1p_battery_soc"),
-            read("sensor.solis_s6_eh1p_battery_charge_power"),
-            read("sensor.solis_s6_eh1p_battery_discharge_power"),
-        )?;
-        battery_snapshot_with_metadata([&soc, &charge, &discharge], chrono::Utc::now()).map_err(
-            |error| {
-                eprintln!(
-                    "Battery snapshot rejected: reason={}",
-                    diagnostic_status(error.as_ref())
-                );
-                error
-            },
-        )
+        result.inspect_err(|error| {
+            eprintln!(
+                "Battery snapshot rejected: reason={}",
+                diagnostic_status(error.as_ref())
+            )
+        })
     }
 }
 
 fn battery_history_payload(
     entities: [&EntityState; 3],
+    activity: Option<&EntityState>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
-    match battery_snapshot_with_metadata(entities, now) {
+    match battery_snapshot_with_activity(entities, activity, now) {
         Ok(snapshot) => {
             serde_json::json!({"soc_percent":snapshot.values[0],"charge_power_w":snapshot.values[1],"discharge_power_w":snapshot.values[2],"freshness":snapshot.freshness})
         }
@@ -107,11 +125,36 @@ pub struct BatterySnapshot {
     pub freshness: serde_json::Value,
 }
 
+#[cfg(test)]
 fn battery_snapshot_with_metadata(
     entities: [&EntityState; 3],
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<BatterySnapshot, Box<dyn std::error::Error + Send + Sync>> {
-    let values = validate_battery_snapshot(entities, now)?;
+) -> Result<BatterySnapshot, ReadError> {
+    battery_snapshot_with_activity(entities, None, now)
+}
+
+fn valid_activity(entity: &EntityState, now: chrono::DateTime<chrono::Utc>) -> Option<Reading> {
+    validate(entity, now, 300)
+        .ok()
+        .filter(|r| matches!(r.unit.as_deref(), Some("W" | "kW")))
+}
+
+fn battery_snapshot_with_activity(
+    entities: [&EntityState; 3],
+    activity: Option<&EntityState>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<BatterySnapshot, ReadError> {
+    let values = validate_battery_snapshot_with_activity(entities, activity, now)?;
+    let battery_recent = entities.iter().any(|e| {
+        now.signed_duration_since(e.last_reported.unwrap_or(e.last_updated))
+            <= chrono::Duration::seconds(300)
+    });
+    let activity_metadata = activity.and_then(|entity| valid_activity(entity,now).map(|reading| serde_json::json!({
+        "entity_id":BATTERY_ACTIVITY_ENTITY,"status":"fresh","role":"same_inverter_activity_not_battery_measurement",
+        "observed_at":reading.observed_at,"last_updated":entity.last_updated,"last_changed":entity.last_changed,
+        "last_reported":entity.last_reported,"observed_at_source":if entity.last_reported.is_some(){"last_reported"}else{"last_updated"},
+        "age_seconds":now.signed_duration_since(reading.observed_at).num_milliseconds() as f64 / 1000.0,
+    })));
     let mut sources = serde_json::Map::new();
     let ids = [
         "sensor.solis_s6_eh1p_battery_soc",
@@ -141,7 +184,9 @@ fn battery_snapshot_with_metadata(
     Ok(BatterySnapshot {
         values,
         freshness: serde_json::json!({
-            "fetched_at":now,"status":"recent_group_activity","policy":"at_least_one_recent_inverter_report",
+            "fetched_at":now,"status":"recent_group_activity",
+            "policy":if battery_recent {"at_least_one_recent_inverter_report"}else{"recent_confirmed_same_inverter_activity"},
+            "activity_source":activity_metadata,
             "max_age_seconds":300,"future_tolerance_seconds":30,"all_sources_recent":all_fresh,"sources":sources,
             "timestamp_basis":"Home Assistant reports; not independent device measurement timestamps",
         }),
@@ -218,7 +263,7 @@ pub(crate) fn validate(
     validate_with_age(entity, now, Some(max_age))
 }
 
-fn validate_with_age(
+pub(crate) fn validate_with_age(
     entity: &EntityState,
     now: chrono::DateTime<chrono::Utc>,
     max_age: Option<i64>,
@@ -280,7 +325,15 @@ impl HomeAssistantClient {
 fn validate_battery_snapshot(
     entities: [&EntityState; 3],
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<[f64; 3], Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<[f64; 3], ReadError> {
+    validate_battery_snapshot_with_activity(entities, None, now)
+}
+
+fn validate_battery_snapshot_with_activity(
+    entities: [&EntityState; 3],
+    activity: Option<&EntityState>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<[f64; 3], ReadError> {
     let mut values = [0.0; 3];
     let mut active = false;
     for (index, entity) in entities.into_iter().enumerate() {
@@ -297,7 +350,7 @@ fn validate_battery_snapshot(
             return Err(InvalidReading::Invalid.into());
         }
     }
-    if !active {
+    if !active && activity.and_then(|e| valid_activity(e, now)).is_none() {
         return Err(InvalidReading::Stale.into());
     }
     Ok(values)
@@ -455,7 +508,7 @@ mod history_tests {
         let soc = entity("50", "%");
         let charge = entity("0", "W");
         let discharge = entity("20", "W");
-        let payload = battery_history_payload([&soc, &charge, &discharge], now);
+        let payload = battery_history_payload([&soc, &charge, &discharge], None, now);
         assert_eq!(payload["status"], "stale");
         assert!(payload["soc_percent"].is_null());
         assert_eq!(
@@ -463,5 +516,157 @@ mod history_tests {
             serde_json::json!(old)
         );
         assert_eq!(payload["freshness"]["fetched_at"], serde_json::json!(now));
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    fn entity(value: &str, unit: &str, at: chrono::DateTime<chrono::Utc>) -> EntityState {
+        EntityState {
+            state: value.into(),
+            attributes: serde_json::json!({"unit_of_measurement":unit}),
+            last_changed: at,
+            last_updated: at,
+            last_reported: Some(at),
+        }
+    }
+    #[test]
+    fn idle_battery_accepts_same_inverter_activity_without_refreshing_measurement_times() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        let soc = entity("98", "%", old);
+        let charge = entity("0", "W", old);
+        let discharge = entity("0", "W", old);
+        let activity = entity("-0.1", "kW", now);
+        assert!(battery_snapshot_with_activity([&soc, &charge, &discharge], None, now).is_err());
+        let snapshot =
+            battery_snapshot_with_activity([&soc, &charge, &discharge], Some(&activity), now)
+                .unwrap();
+        assert_eq!(snapshot.values, [98.0, 0.0, 0.0]);
+        assert_eq!(
+            snapshot.freshness["policy"],
+            "recent_confirmed_same_inverter_activity"
+        );
+        assert_eq!(snapshot.freshness["all_sources_recent"], false);
+        for name in ["soc_percent", "charge_power_w", "discharge_power_w"] {
+            assert_eq!(
+                snapshot.freshness["sources"][name]["observed_at"],
+                serde_json::json!(old)
+            );
+            assert_eq!(
+                snapshot.freshness["sources"][name]["status"],
+                "older_report_accepted_via_group"
+            );
+        }
+        assert_eq!(
+            snapshot.freshness["activity_source"]["entity_id"],
+            BATTERY_ACTIVITY_ENTITY
+        );
+        assert_eq!(
+            snapshot.freshness["activity_source"]["observed_at"],
+            serde_json::json!(now)
+        );
+        assert_eq!(
+            snapshot.freshness["activity_source"]["role"],
+            "same_inverter_activity_not_battery_measurement"
+        );
+        assert!(
+            battery_snapshot_with_activity(
+                [&soc, &charge, &discharge],
+                Some(&activity),
+                now + chrono::Duration::seconds(301)
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn bad_stale_future_or_inconsistent_activity_does_not_rescue_old_battery() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        let soc = entity("98", "%", old);
+        let charge = entity("0", "W", old);
+        let discharge = entity("0", "W", old);
+        for activity in [
+            entity("50", "W", now - chrono::Duration::seconds(301)),
+            entity("50", "W", now + chrono::Duration::seconds(31)),
+            entity("unavailable", "W", now),
+            entity("NaN", "W", now),
+            entity("50", "kWh", now),
+        ] {
+            assert!(
+                battery_snapshot_with_activity([&soc, &charge, &discharge], Some(&activity), now)
+                    .is_err()
+            );
+        }
+        let mut activity = entity("50", "W", now);
+        activity.last_changed = now + chrono::Duration::seconds(1);
+        assert!(
+            battery_snapshot_with_activity([&soc, &charge, &discharge], Some(&activity), now)
+                .is_err()
+        );
+    }
+    #[test]
+    fn activity_never_bypasses_battery_value_unit_or_timestamp_validation() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(1);
+        let activity = entity("10", "W", now);
+        let good = entity("0", "W", old);
+        for soc in [
+            entity("101", "%", old),
+            entity("NaN", "%", old),
+            entity("98", "kWh", old),
+            entity("98", "%", now + chrono::Duration::seconds(31)),
+        ] {
+            assert!(
+                battery_snapshot_with_activity([&soc, &good, &good], Some(&activity), now).is_err()
+            );
+        }
+        let soc = entity("98", "%", old);
+        for power in [
+            entity("unavailable", "W", old),
+            entity("-1", "W", old),
+            entity("0", "kWh", old),
+        ] {
+            assert!(
+                battery_snapshot_with_activity([&soc, &power, &good], Some(&activity), now)
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn client_only_reads_activity_for_an_otherwise_valid_old_group() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let old_group = Arc::new(AtomicBool::new(false));
+        let invalid = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (age_flag, bad_flag, count) = (old_group.clone(), invalid.clone(), calls.clone());
+        let mock=axum::Router::new().route("/api/states/{id}",axum::routing::get(move |axum::extract::Path(id):axum::extract::Path<String>| {
+            let (age_flag,bad_flag,count)=(age_flag.clone(),bad_flag.clone(),count.clone());
+            async move {
+                let is_activity=id==BATTERY_ACTIVITY_ENTITY;
+                if is_activity {count.fetch_add(1,Ordering::SeqCst);}
+                let at=chrono::Utc::now()-chrono::Duration::seconds(if age_flag.load(Ordering::SeqCst)&&!is_activity {3600}else{0});
+                axum::Json(serde_json::json!({"state":if id.ends_with("_soc") {if bad_flag.load(Ordering::SeqCst) {"unavailable"} else {"98"}}else{"0"},"attributes":{"unit_of_measurement":if id.ends_with("_soc") {"%"}else{"W"}},"last_changed":at,"last_updated":at,"last_reported":at}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, mock).await.unwrap();
+        });
+        let client = HomeAssistantClient::new(base, "fixture".into()).unwrap();
+        client.battery_snapshot().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        old_group.store(true, Ordering::SeqCst);
+        client.battery_snapshot().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        invalid.store(true, Ordering::SeqCst);
+        assert!(client.battery_snapshot().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 }

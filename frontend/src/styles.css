@@ -5,3 +5,6 @@
 #history label { max-width: 100%; flex-wrap: wrap; }
 .history-line { fill: none; stroke: #55b7ff; stroke-width: 2; }
 .history-point { fill: #55b7ff; }
+
+.costs-card { min-width: 0; }
+.costs-card table { font-size: .9em; }

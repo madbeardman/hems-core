@@ -152,6 +152,7 @@ fn sample(
         "valid"
             | "derived"
             | "estimated_with_assumed_zero"
+            | "delayed_period"
             | "assumed_zero"
             | "fresh"
             | "older_report_accepted_via_group"
@@ -200,7 +201,7 @@ fn record(
 ) -> Result<(), Error> {
     let tx = db.transaction()?;
     match kind {
-        "energy" => {
+        "energy" | "costs" => {
             if let Some(entries) = payload.as_object() {
                 for (metric, entry) in entries {
                     if entry.is_object() && entry.get("status").is_some() {

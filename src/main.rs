@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod costs;
 mod frontend;
 mod history;
 mod home_assistant;
@@ -27,12 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history =
         history::History::open(history::HistoryConfig::from_env().map_err(|e| e.to_string())?)
             .map_err(|_| "Unable to open/migrate history database")?;
+    let costs = costs::CostsState::from_env(state.ha.clone())?;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let cost_collector = costs::start(costs.clone(), history.clone(), stop_rx.clone());
     let collector = history::start(history.clone(), state.clone(), stop_rx);
     let app = Router::new()
         .nest("/api/history", history::router(history))
         .merge(frontend::router())
-        .nest("/api", api::router(state));
+        .nest("/api", api::router(state).merge(costs::router(costs)));
 
     let address = format!("{}:{}", config.host, config.port);
 
@@ -51,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     collector.await?;
+    cost_collector.await?;
 
     Ok(())
 }

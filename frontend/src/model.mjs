@@ -53,9 +53,15 @@ export function batteryView(data, now = Date.now()) {
   const fetched = Date.parse(data.freshness?.fetched_at);
   if (!Number.isFinite(fetched) || now - fetched > 300000 || fetched - now > 30000) return null;
   const sources = Object.values(data.freshness?.sources ?? {});
-  if (!sources.some(s => { const stamp = Date.parse(s.observed_at); return Number.isFinite(stamp) && now - stamp <= 300000 && stamp - now <= 30000; })) return null;
+  const recent = source => { const stamp = Date.parse(source?.observed_at); return Number.isFinite(stamp) && now - stamp <= 300000 && stamp - now <= 30000; };
+  const batteryRecent = sources.some(recent);
+  const activity = data.freshness.activity_source;
+  const inverterRecent = data.freshness.policy === 'recent_confirmed_same_inverter_activity'
+    && activity?.entity_id === 'sensor.solis_s6_eh1p_active_power'
+    && activity.status === 'fresh' && activity.role === 'same_inverter_activity_not_battery_measurement' && recent(activity);
+  if (!batteryRecent && !inverterRecent) return null;
   const charge = Math.max(0, data.charge_power_w), discharge = Math.max(0, data.discharge_power_w);
-  return { soc: data.soc_percent, charge, discharge, state: charge > 0 && discharge > 0 ? 'Mixed flow' : charge > 0 ? 'Charging' : discharge > 0 ? 'Discharging' : 'Idle', older: sources.some(s => now - Date.parse(s.observed_at) > 300000) };
+  return { soc: data.soc_percent, charge, discharge, activityOnly: !batteryRecent && inverterRecent, state: charge > 0 && discharge > 0 ? 'Mixed flow' : charge > 0 ? 'Charging' : discharge > 0 ? 'Discharging' : 'Idle', older: sources.some(s => now - Date.parse(s.observed_at) > 300000) };
 }
 export const londonTime = value => {
   const date = new Date(value);
@@ -76,4 +82,19 @@ export function historySegments(rows, intervalSeconds = 60) {
   }
   if (segment.length) segments.push(segment);
   return segments;
+}
+
+
+export function costReading(payload, key, now = Date.now()) {
+  const entry = payload?.readings?.[key];
+  const fetched = Date.parse(payload?.fetched_at);
+  if (!Number.isFinite(fetched) || now - fetched > 180000 || fetched - now > 30000 || !finite(entry?.reading?.value) || !['valid', 'delayed_period'].includes(entry.status)) return null;
+  const today = londonDateKey(now);
+  if (key.includes('_today_') && entry.period_day !== today) return null;
+  return { ...entry, value: entry.reading.value };
+}
+export function todayCostTotal(payload, now = Date.now()) {
+  const electricity = costReading(payload, 'electricity_today_cost', now);
+  const gas = costReading(payload, 'gas_today_cost', now);
+  return electricity && gas ? electricity.value + gas.value : null;
 }
