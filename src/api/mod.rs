@@ -1,3 +1,5 @@
+mod grid_export;
+
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::Serialize;
 
@@ -22,14 +24,6 @@ struct VersionResponse {
 }
 
 #[derive(Serialize)]
-struct BatteryResponse {
-    soc_percent: f64,
-    charge_power_w: f64,
-    discharge_power_w: f64,
-    freshness: serde_json::Value,
-}
-
-#[derive(Serialize)]
 struct ApiError {
     error: &'static str,
 }
@@ -50,32 +44,17 @@ async fn version() -> Json<VersionResponse> {
 
 async fn battery(
     State(state): State<AppState>,
-) -> Result<Json<BatteryResponse>, (StatusCode, Json<ApiError>)> {
-    let snapshot = state.ha.battery_snapshot().await.map_err(|_| {
-        (
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let payload = state.ha.history_battery().await;
+    if payload["soc_percent"].is_null() {
+        return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
                 error: "Unable to retrieve battery data from Home Assistant",
             }),
-        )
-    })?;
-
-    let [soc, charge, discharge] = snapshot.values;
-    if !(0.0..=100.0).contains(&soc) || charge < 0.0 || discharge < 0.0 {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(ApiError {
-                error: "Home Assistant returned invalid battery data",
-            }),
         ));
     }
-
-    Ok(Json(BatteryResponse {
-        soc_percent: soc,
-        charge_power_w: charge,
-        discharge_power_w: discharge,
-        freshness: snapshot.freshness,
-    }))
+    Ok(Json(payload))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -84,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/battery", get(battery))
         .route("/energy", get(energy))
+        .route("/grid-export", get(grid_export::get))
         .route("/prices", get(prices))
         .route("/forecasts", get(forecasts))
         .with_state(state)
@@ -212,6 +192,84 @@ fn normalize(
     Ok(())
 }
 
+// Fixed, confirmed physical FIT inverter. Never use hybrid activity to rescue it.
+const FIT_POWER_ENTITY: &str = "sensor.solis_s6_gr1p_active_power";
+const FIT_ACTIVITY_ENTITY: &str = "sensor.solis_s6_gr1p_dc_voltage_1";
+
+async fn energy_source(
+    state: &AppState,
+    name: &str,
+    id: &str,
+    entry: &mut serde_json::Value,
+) -> Result<crate::home_assistant::Reading, Box<dyn std::error::Error + Send + Sync>> {
+    let entity = state.ha.entity(id).await?;
+    let now = chrono::Utc::now();
+    entry["fetched_at"] = serde_json::json!(now);
+    entry["source_timestamps"] = serde_json::json!({
+        "last_updated":entity.last_updated,"last_changed":entity.last_changed,"last_reported":entity.last_reported,
+        "observed_at":entity.last_reported.unwrap_or(entity.last_updated),
+        "timestamp_basis":"Home Assistant reports, not independent device measurement timestamps",
+    });
+    match crate::home_assistant::validate(&entity, now, 300) {
+        Ok(reading) => Ok(reading),
+        Err(error) => {
+            if name == "fit_pv"
+                && id == FIT_POWER_ENTITY
+                && state.collection.pv_confirmed
+                && crate::home_assistant::reading_error_status(error.as_ref()) == "stale"
+            {
+                // Validate the old value before considering group activity. It stays
+                // an old AC report; voltage is never converted into PV power.
+                let mut old = crate::home_assistant::validate_with_age(&entity, now, None)?;
+                if normalize(&mut old, "W", false).is_ok() {
+                    let activity = tokio::time::timeout(
+                        std::time::Duration::from_secs(4),
+                        state.ha.entity(FIT_ACTIVITY_ENTITY),
+                    )
+                    .await;
+                    if let Ok(Ok(activity)) = activity {
+                        let checked_at = chrono::Utc::now();
+                        if let Ok(witness) =
+                            crate::home_assistant::validate(&activity, checked_at, 300)
+                        {
+                            if witness.unit.as_deref() == Some("V") && witness.value >= 0.0 {
+                                entry["status"] = "older_report_accepted_via_group".into();
+                                entry["freshness"] = serde_json::json!({
+                                    "status":"recent_group_activity","policy":"recent_confirmed_fit_inverter_activity",
+                                    "fetched_at":checked_at,"max_age_seconds":300,"future_tolerance_seconds":30,
+                                    "activity_source":{"entity_id":FIT_ACTIVITY_ENTITY,"status":"fresh",
+                                        "role":"same_fit_inverter_activity_not_ac_measurement",
+                                        "observed_at":witness.observed_at,"last_changed":activity.last_changed,
+                                        "last_updated":activity.last_updated,"last_reported":activity.last_reported},
+                                    "note":"Old AC power accepted using activity from the same FIT inverter; not a new AC measurement",
+                                });
+                                return Ok(old);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn solar_source_accepted(entry: &serde_json::Value) -> bool {
+    entry["status"] == "valid" || entry["status"] == "older_report_accepted_via_group"
+}
+fn solar_alignment_time(entry: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = if entry["status"] == "older_report_accepted_via_group" {
+        &entry["freshness"]["activity_source"]["observed_at"]
+    } else {
+        &entry["reading"]["observed_at"]
+    };
+    value.as_str()?.parse().ok()
+}
+fn time_span(times: impl Iterator<Item = chrono::DateTime<chrono::Utc>>) -> Option<f64> {
+    let times: Vec<_> = times.collect();
+    Some((*times.iter().max()? - *times.iter().min()?).num_milliseconds() as f64 / 1000.0)
+}
+
 const SOLAR_MAX_SKEW_SECONDS: i64 = 120;
 
 fn solar_total(pv: &[(f64, chrono::DateTime<chrono::Utc>)], confirmed: bool) -> Option<f64> {
@@ -263,7 +321,7 @@ fn apply_solar_zero_policy(result: &mut serde_json::Map<String, serde_json::Valu
     let mut assumed = 0;
     for name in ["fit_pv", "hybrid_pv_1", "hybrid_pv_2"] {
         if let Some(entry) = result.get_mut(name) {
-            if entry["status"] != "valid" {
+            if !solar_source_accepted(entry) {
                 entry["source_status"] = entry["status"].clone();
                 entry["status"] = "assumed_zero".into();
                 entry["value"] = serde_json::json!(0.0);
@@ -388,6 +446,7 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut result = serde_json::Map::new();
     let mut seen = std::collections::HashSet::new();
     let mut pv = Vec::new();
+    let mut pv_observed = Vec::new();
     for &(name, _, unit) in INPUTS {
         let id = state
             .collection
@@ -401,27 +460,23 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
             if !seen.insert(id.clone()) {
                 entry["status"] = "duplicate_entity".into();
             } else {
-                match state.ha.entity(&id).await.and_then(|entity| {
-                    entry["fetched_at"] = serde_json::json!(chrono::Utc::now());
-                    entry["source_timestamps"] = serde_json::json!({
-                        "last_updated":entity.last_updated,"last_changed":entity.last_changed,
-                        "last_reported":entity.last_reported,
-                        "observed_at":entity.last_reported.unwrap_or(entity.last_updated),
-                        "timestamp_basis":"Home Assistant reports, not independent device measurement timestamps"
-                    });
-                    crate::home_assistant::validate(&entity, chrono::Utc::now(), 300)
-                }) {
+                match energy_source(&state, name, &id, &mut entry).await {
                     Ok(mut reading) => match normalize(
                         &mut reading,
                         unit,
                         matches!(name, "grid_net" | "hybrid_ac"),
                     ) {
                         Ok(()) => {
-                            if name == "fit_pv" || name.starts_with("hybrid_pv_") {
-                                pv.push((reading.value, reading.observed_at));
+                            if entry["status"] != "older_report_accepted_via_group" {
+                                entry["status"] = "valid".into();
                             }
-                            entry["status"] = "valid".into();
-                            entry["reading"] = serde_json::to_value(reading).unwrap();
+                            entry["reading"] = serde_json::to_value(&reading).unwrap();
+                            if name == "fit_pv" || name.starts_with("hybrid_pv_") {
+                                pv_observed.push(reading.observed_at);
+                                if let Some(aligned) = solar_alignment_time(&entry) {
+                                    pv.push((reading.value, aligned));
+                                }
+                            }
                         }
                         Err(reason) => entry["status"] = reason.into(),
                     },
@@ -462,17 +517,33 @@ async fn energy(State(state): State<AppState>) -> Json<serde_json::Value> {
     }
     // Numeric zero fallback is explicit in quality metadata, not a fresh reading.
     let confirmed = state.collection.pv_confirmed;
-    let (total, total_status) = solar_public_total(&pv, confirmed, assumed_solar_inputs);
+    let (total, mut total_status) = solar_public_total(&pv, confirmed, assumed_solar_inputs);
+    let older = ["fit_pv", "hybrid_pv_1", "hybrid_pv_2"]
+        .iter()
+        .filter(|name| {
+            result
+                .get(**name)
+                .is_some_and(|e| e["status"] == "older_report_accepted_via_group")
+        })
+        .count();
+    if older > 0 {
+        total_status = match total_status {
+            "valid_estimate" => "estimated_with_older_reports",
+            "estimated_with_assumed_zero" => "estimated_with_assumed_zero_and_older_reports",
+            other => other,
+        };
+    }
+    result.insert("solar_older_report_inputs".into(), serde_json::json!(older));
+    result.insert(
+        "solar_total_alignment_span_seconds".into(),
+        serde_json::json!(time_span(pv.iter().map(|(_, t)| *t))),
+    );
+    result.insert("solar_total_alignment_basis".into(),serde_json::json!("HA report times, using same-inverter activity time for group-accepted old values; not proof of simultaneous measurements"));
     result.insert(
         "solar_assumed_zero_inputs".into(),
         serde_json::json!(assumed_solar_inputs),
     );
-    let span = pv
-        .iter()
-        .map(|(_, t)| *t)
-        .max()
-        .zip(pv.iter().map(|(_, t)| *t).min())
-        .map(|(newest, oldest)| (newest - oldest).num_milliseconds() as f64 / 1000.0);
+    let span = time_span(pv_observed.into_iter());
     result.insert("solar_total_status".into(), serde_json::json!(total_status));
     result.insert(
         "solar_total_max_skew_seconds".into(),
@@ -886,6 +957,65 @@ mod http_tests {
         });
         (url, task)
     }
+    #[tokio::test]
+    async fn grid_export_reads_only_octopus_and_keeps_partial_results() {
+        use axum::{extract::Path, response::IntoResponse};
+        use chrono::{Duration, Utc};
+        use serde_json::{Value, json};
+
+        let mock = Router::new().route(
+            "/api/states/{id}",
+            get(|Path(id): Path<String>| async move {
+                let now = Utc::now();
+                let (value, unit, report) = match id.as_str() {
+                    "sensor.octopus_grid_export_daily" => ("1250", "Wh", now),
+                    "sensor.octopus_grid_export_monthly" => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    "sensor.octopus_grid_export_yearly" => {
+                        ("25", "kWh", now - Duration::minutes(6))
+                    }
+                    "sensor.octopus_grid_export_energy" => ("100", "kWh", now),
+                    _ => panic!("Unexpected source: {id}"),
+                };
+                Json(json!({
+                    "state": value, "attributes": {"unit_of_measurement": unit},
+                    "last_changed": report, "last_updated": report, "last_reported": report,
+                }))
+                .into_response()
+            }),
+        );
+        let (ha_url, ha_task) = serve(mock).await;
+        let state = AppState {
+            ha: HomeAssistantClient::new(ha_url, "test-only-token".into()).unwrap(),
+            collection: CollectionConfig {
+                sources: Default::default(),
+                rates_entity: String::new(),
+                next_day_rates_entity: String::new(),
+                pv_confirmed: false,
+                forecast_entities: Vec::new(),
+                forecast_confirmed: false,
+            },
+        };
+        let (url, task) = serve(router(state)).await;
+        let body: Value = reqwest::get(format!("{url}/grid-export"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["daily"]["reading"]["value"], 1.25);
+        assert_eq!(body["monthly"]["status"], "ha_entity_not_found");
+        assert_eq!(body["yearly"]["status"], "stale");
+        assert!(body["yearly"]["reading"]["value"].is_null());
+        assert!(body.get("cumulative").is_none());
+        assert_eq!(body["diagnostics"]["cumulative"]["reading"]["value"], 100.0);
+        task.abort();
+        ha_task.abort();
+    }
+
     #[tokio::test]
     async fn preserves_endpoints_with_read_only_battery_requests() {
         let mock = Router::new().route("/api/states/{id}", get(|axum::extract::Path(id): axum::extract::Path<String>, headers: axum::http::HeaderMap| async move {
@@ -1386,86 +1516,312 @@ pub(crate) async fn history_battery(state: AppState) -> serde_json::Value {
 mod battery_activity_http_tests {
     use super::*;
     #[tokio::test]
-    async fn idle_battery_endpoint_and_history_use_the_same_explicit_activity_provenance() {
+    async fn older_inverter_soc_survives_active_or_stale_power_but_invalid_soc_does_not() {
         use std::sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicUsize, Ordering},
         };
-        let live = Arc::new(AtomicBool::new(true));
-        let live_flag = live.clone();
-        let old = chrono::Utc::now() - chrono::Duration::hours(1);
-        let mock=Router::new().route("/api/states/{id}",get(move |axum::extract::Path(id):axum::extract::Path<String>| {
-            let live=live_flag.clone();
+        let mode = Arc::new(AtomicUsize::new(0));
+        let fixture = mode.clone();
+        let old = chrono::Utc::now() - chrono::Duration::hours(12);
+        let mock = Router::new().route("/api/states/{id}", get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+            let mode = fixture.load(Ordering::SeqCst);
             async move {
-                let activity=id=="sensor.solis_s6_eh1p_active_power";
-                let at=if activity {chrono::Utc::now()}else{old};
-                Json(serde_json::json!({"state":if activity&&!live.load(Ordering::SeqCst) {"unavailable"}else if id.ends_with("_soc") {"98"}else{"0"},"attributes":{"unit_of_measurement":if id.ends_with("_soc") {"%"}else{"W"}},"last_changed":at,"last_updated":at,"last_reported":at}))
+                let soc = id.ends_with("_soc");
+                let at = if soc || mode == 2 { old } else { chrono::Utc::now() };
+                let value = match (soc, mode, id.ends_with("_charge_power")) {
+                    (true, 3, _) => "unavailable",
+                    (true, 4, _) => "101",
+                    (true, 5, _) => "unknown",
+                    (true, _, _) => "98",
+                    (false, 0, true) | (false, 1, false) => "500",
+                    _ => "0",
+                };
+                Json(serde_json::json!({"state":value,"attributes":{"unit_of_measurement":if soc {"%"} else {"W"}},"last_changed":at,"last_updated":at}))
             }
         }));
         let (base, upstream) = super::http_tests::serve(mock).await;
         let ha = HomeAssistantClient::new(base, "fixture".into()).unwrap();
-        let history = crate::history::History::open(crate::history::HistoryConfig {
+        let (url, server) = super::http_tests::serve(router(AppState {
+            ha: ha.clone(),
+            collection: CollectionConfig::from_env().unwrap(),
+        }))
+        .await;
+        for state in 0..=5 {
+            mode.store(state, Ordering::SeqCst);
+            let response = reqwest::get(format!("{url}/battery")).await.unwrap();
+            if state >= 3 {
+                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                assert!(ha.history_battery().await["soc_percent"].is_null());
+                continue;
+            }
+            let body: serde_json::Value =
+                response.error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(body["soc_percent"], 98.0);
+            let source = &body["freshness"]["sources"]["soc_percent"];
+            assert_eq!(source["status"], "last_known");
+            assert_eq!(source["observed_at"], serde_json::json!(old));
+            assert_eq!(source["observed_at_source"], "last_updated");
+            match state {
+                0 => assert_eq!(body["charge_power_w"], 500.0),
+                1 => assert_eq!(body["discharge_power_w"], 500.0),
+                _ => {
+                    assert!(body["charge_power_w"].is_null() && body["discharge_power_w"].is_null())
+                }
+            }
+        }
+        upstream.abort();
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod fit_activity_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    struct Fixture {
+        source: &'static str,
+        unit: &'static str,
+        source_offset: i64,
+        activity: &'static str,
+        activity_unit: &'static str,
+        activity_offset: i64,
+    }
+    async fn fixture(
+        config: Fixture,
+    ) -> (
+        AppState,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let log = requests.clone();
+        let mock=Router::new().route("/api/states/{id}",get(move |axum::extract::Path(id):axum::extract::Path<String>| {
+            let log=log.clone();let is_activity=id==FIT_ACTIVITY_ENTITY;
+            log.lock().unwrap().push(id.clone());
+            let (value,unit,offset)=if is_activity {(config.activity,config.activity_unit,config.activity_offset)}else if id==FIT_POWER_ENTITY||id=="sensor.custom_fit" {(config.source,config.unit,config.source_offset)}else if id=="sensor.hybrid_one" {("30","W",0)}else{("8","W",0)};
+            async move {let at=chrono::Utc::now()-chrono::Duration::seconds(offset);Json(serde_json::json!({"state":value,"attributes":{"unit_of_measurement":unit},"last_changed":at,"last_updated":at,"last_reported":at}))}
+        }));
+        let (base, task) = super::http_tests::serve(mock).await;
+        let state = AppState {
+            ha: HomeAssistantClient::new(base, "fixture".into()).unwrap(),
+            collection: CollectionConfig {
+                sources: std::collections::HashMap::from([
+                    ("fit_pv", FIT_POWER_ENTITY.into()),
+                    ("hybrid_pv_1", "sensor.hybrid_one".into()),
+                    ("hybrid_pv_2", "sensor.hybrid_two".into()),
+                    ("grid_net", HOUSEHOLD_AC_INPUTS[0].1.into()),
+                    ("hybrid_ac", HOUSEHOLD_AC_INPUTS[2].1.into()),
+                ]),
+                rates_entity: String::new(),
+                next_day_rates_entity: String::new(),
+                pv_confirmed: true,
+                forecast_entities: Vec::new(),
+                forecast_confirmed: false,
+            },
+        };
+        (state, requests, task)
+    }
+    fn normal() -> Fixture {
+        Fixture {
+            source: "20",
+            unit: "W",
+            source_offset: 3600,
+            activity: "227",
+            activity_unit: "V",
+            activity_offset: 0,
+        }
+    }
+    #[tokio::test]
+    async fn twenty_watt_fit_report_survives_with_original_time_total_and_history_quality() {
+        let (state, requests, upstream) = fixture(normal()).await;
+        let h = crate::history::History::open(crate::history::HistoryConfig {
             path: ":memory:".into(),
             interval: 60,
             days: 30,
         })
         .unwrap();
-        let state = AppState {
-            ha: ha.clone(),
-            collection: CollectionConfig::from_env().unwrap(),
-        };
         let (url, server) = super::http_tests::serve(
-            router(state).nest("/history", crate::history::router(history.clone())),
+            router(state.clone()).nest("/history", crate::history::router(h.clone())),
         )
         .await;
         let client = reqwest::Client::new();
-        let response = client.get(format!("{url}/battery")).send().await.unwrap();
+        let response = client.get(format!("{url}/energy")).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["soc_percent"], 98.0);
-        assert_eq!(body["charge_power_w"], 0.0);
-        assert_eq!(body["discharge_power_w"], 0.0);
+        let p: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(p["fit_pv"]["reading"]["value"], 20.0);
+        assert_eq!(p["fit_pv"]["status"], "older_report_accepted_via_group");
+        assert!(p["fit_pv"]["source_status"].is_null());
+        assert_eq!(p["solar_assumed_zero_inputs"], 0);
+        assert_eq!(p["solar_total_w"], 58.0);
+        assert_eq!(p["solar_total_status"], "estimated_with_older_reports");
+        assert!(p["solar_total_observation_span_seconds"].as_f64().unwrap() > 3500.0);
+        assert!(p["solar_total_alignment_span_seconds"].as_f64().unwrap() < 5.0);
+        let observed = &p["fit_pv"]["reading"]["observed_at"];
         assert_eq!(
-            body["freshness"]["policy"],
-            "recent_confirmed_same_inverter_activity"
+            observed,
+            p["fit_pv"]["source_timestamps"]["observed_at"]
+                .as_str()
+                .unwrap()
         );
-        let payload = ha.history_battery().await;
         assert_eq!(
-            payload["freshness"]["sources"]["soc_percent"]["observed_at"],
-            serde_json::json!(old)
+            p["fit_pv"]["freshness"]["activity_source"]["entity_id"],
+            FIT_ACTIVITY_ENTITY
         );
-        history
-            .record("battery", payload, chrono::Utc::now())
+        h.record("energy", p.clone(), chrono::Utc::now())
             .await
             .unwrap();
         let saved: serde_json::Value = client
-            .get(format!("{url}/history/samples?metric=soc_percent"))
+            .get(format!("{url}/history/samples?metric=fit_pv"))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        assert_eq!(saved["rows"][0]["value"], 20.0);
         assert_eq!(
             saved["rows"][0]["status"],
             "older_report_accepted_via_group"
         );
+        assert_eq!(saved["rows"][0]["observed_at"], *observed);
         assert_eq!(
             saved["rows"][0]["provenance"]["freshness"]["activity_source"]["entity_id"],
-            "sensor.solis_s6_eh1p_active_power"
+            FIT_ACTIVITY_ENTITY
         );
-        live.store(false, Ordering::SeqCst);
         assert_eq!(
-            client
-                .get(format!("{url}/battery"))
-                .send()
-                .await
+            requests
+                .lock()
                 .unwrap()
-                .status(),
-            StatusCode::BAD_GATEWAY
+                .iter()
+                .filter(|id| id.as_str() == FIT_ACTIVITY_ENTITY)
+                .count(),
+            1
         );
-        assert!(ha.history_battery().await["soc_percent"].is_null());
+        // An old AC report must not silently become a simultaneous AC-balance input.
+        assert!(p["household_ac_balance"]["reading"].is_null());
         upstream.abort();
         server.abort();
+    }
+    #[tokio::test]
+    async fn stale_bad_or_future_fit_activity_keeps_the_explicit_zero_fallback() {
+        for (value, unit, offset) in [
+            ("227", "V", 301),
+            ("227", "V", -31),
+            ("unavailable", "V", 0),
+            ("NaN", "V", 0),
+            ("227", "W", 0),
+            ("-1", "V", 0),
+        ] {
+            let mut f = normal();
+            f.activity = value;
+            f.activity_unit = unit;
+            f.activity_offset = offset;
+            let (state, _, task) = fixture(f).await;
+            let p = energy(State(state)).await.0;
+            assert_eq!(p["fit_pv"]["status"], "assumed_zero");
+            assert_eq!(p["fit_pv"]["source_status"], "stale");
+            assert_eq!(p["fit_pv"]["reading"]["value"], 0.0);
+            assert_eq!(p["solar_total_w"], 38.0);
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn invalid_fit_values_are_not_rescued_and_fresh_fit_does_not_read_extra_sensors() {
+        for (value, unit, offset) in [
+            ("unavailable", "W", 3600),
+            ("NaN", "W", 3600),
+            ("-1", "W", 3600),
+            ("20", "kWh", 3600),
+            ("20", "W", -31),
+            ("20", "W", 0),
+        ] {
+            let mut f = normal();
+            f.source = value;
+            f.unit = unit;
+            f.source_offset = offset;
+            let (state, requests, task) = fixture(f).await;
+            let p = energy(State(state)).await.0;
+            assert!(
+                !requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == FIT_ACTIVITY_ENTITY)
+            );
+            assert_eq!(
+                p["fit_pv"]["status"],
+                if offset == 0 { "valid" } else { "assumed_zero" }
+            );
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn custom_or_unconfirmed_fit_mappings_do_not_borrow_fixed_inverter_activity() {
+        for custom in [false, true] {
+            let (mut state, requests, task) = fixture(normal()).await;
+            if custom {
+                state
+                    .collection
+                    .sources
+                    .insert("fit_pv", "sensor.custom_fit".into());
+            } else {
+                state.collection.pv_confirmed = false;
+            }
+            let p = energy(State(state)).await.0;
+            assert_eq!(p["fit_pv"]["status"], "assumed_zero");
+            assert!(
+                !requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == FIT_ACTIVITY_ENTITY)
+            );
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn fit_activity_skew_still_prevents_an_unaligned_solar_total() {
+        let mut f = normal();
+        f.activity_offset = 180;
+        let (state, _, task) = fixture(f).await;
+        let p = energy(State(state)).await.0;
+        assert_eq!(p["fit_pv"]["reading"]["value"], 20.0);
+        assert_eq!(p["solar_total_w"], 0.0);
+        assert_eq!(p["solar_total_status"], "unavailable_total_assumed_zero");
+        task.abort();
+    }
+}
+
+#[cfg(test)]
+mod fit_normalization_tests {
+    use super::*;
+    #[tokio::test]
+    async fn old_fit_kw_is_normalized_once_and_group_accepted_zero_is_not_an_assumption() {
+        for (value, expected) in [("0.020", 20.0), ("0", 0.0)] {
+            let mock=Router::new().route("/api/states/{id}",get(move |axum::extract::Path(id):axum::extract::Path<String>| async move {
+                let activity=id==FIT_ACTIVITY_ENTITY;let at=chrono::Utc::now()-chrono::Duration::seconds(if activity{0}else{3600});
+                Json(serde_json::json!({"state":if activity{"227"}else{value},"attributes":{"unit_of_measurement":if activity{"V"}else{"kW"}},"last_changed":at,"last_updated":at,"last_reported":at}))
+            }));
+            let (base, task) = super::http_tests::serve(mock).await;
+            let mut config = CollectionConfig::from_env().unwrap();
+            config.sources = std::collections::HashMap::from([("fit_pv", FIT_POWER_ENTITY.into())]);
+            config.pv_confirmed = true;
+            let state = AppState {
+                ha: HomeAssistantClient::new(base, "fixture".into()).unwrap(),
+                collection: config,
+            };
+            let p = energy(State(state)).await.0;
+            assert_eq!(p["fit_pv"]["reading"]["value"], expected);
+            assert_eq!(p["fit_pv"]["reading"]["unit"], "W");
+            assert_eq!(p["fit_pv"]["status"], "older_report_accepted_via_group");
+            assert_eq!(p["solar_assumed_zero_inputs"], 2);
+            assert_eq!(p["solar_total_w"], expected);
+            assert_eq!(
+                p["solar_total_status"],
+                "estimated_with_assumed_zero_and_older_reports"
+            );
+            task.abort();
+        }
     }
 }

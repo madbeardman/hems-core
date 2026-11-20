@@ -12,6 +12,22 @@
 /* Keep modelling text legible on the small display; tables scroll within the card. */
 #modelling { margin-top: 20px; }
 #modelling p, #modelling button, #modelling details { margin-top: 14px; }
-#modelling table { font-size: 1rem; }
-#modelling td, #modelling th { white-space: normal; min-width: 7rem; }
+#modelling td, #modelling th { white-space: normal; }
+#modelling th[scope=row] { min-width: 10rem; }
+#modelling th[scope=col] { min-width: 5rem; }
 #modelling-result { overflow-wrap: anywhere; }
+
+#modelling .table-scroll {
+  margin-block: .5rem;
+  max-width: 100%;
+  border-radius: .25rem;
+}
+#modelling .table-scroll:focus-visible {
+  outline: 3px solid var(--yellow);
+  outline-offset: 2px;
+}
+#modelling table { font-size: .83rem; }
+#modelling h3 { margin-block: 1rem .5rem; font-size: 1rem; }
+#modelling details p, #modelling details ul { font-size: .85rem; }
+
+.flow-stack{display:grid;align-content:start;gap:inherit;min-width:0}

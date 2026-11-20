@@ -1,11 +1,11 @@
-import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates, historySegments, costReading, todayCostTotal } from './model.mjs';
+import { finite, power, reading, humanStatus, intervals, currentRate, forecast, forecastTotal, batteryView, londonTime, dayRates, historySegments, costReading, todayCostTotal, solarEstimate, socReport, gridExportView } from './model.mjs';
+import { make, renderModelling } from './modelling.mjs';
 const $ = id => document.getElementById(id);
 const put = (id, value) => { const node = $(id); if (node && node.textContent !== String(value)) node.textContent = value; };
-const make = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
 const SVG = 'http://www.w3.org/2000/svg';
 const svgNode = (tag, attrs = {}) => { const el = document.createElementNS(SVG, tag); for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value); return el; };
 const state = { records: {}, day: 'today', auto: true, busy: false, lastLive: null };
-const resources = { costs: 60000, energy: 15000, battery: 15000, prices: 300000, forecasts: 300000, health: 60000, version: Infinity };
+const resources = { costs: 60000, 'grid-export': 60000, energy: 15000, battery: 15000, prices: 300000, forecasts: 300000, health: 60000, version: Infinity };
 const data = key => state.records[key]?.error ? null : state.records[key]?.data;
 function pref(key, fallback) { try { return localStorage.getItem(`hems-${key}`) ?? fallback; } catch { return fallback; } }
 function save(key, value) { try { localStorage.setItem(`hems-${key}`, value); } catch { /* Display remains usable without storage. */ } }
@@ -13,22 +13,25 @@ function batteryRender(now) {
   const b = batteryView(data('battery'), now);
   put('battery-soc', b ? `${Math.round(b.soc)}%` : '—'); put('battery-state', b?.state ?? 'Unavailable');
   put('charge', power(b?.charge)); put('discharge', power(b?.discharge));
-  put('battery-quality', b ? b.activityOnly ? 'Battery values have older HA reports; recent AC-power activity from the same inverter confirms group activity, not new battery measurements.' : b.older ? 'Some unchanged values have older reports; recent inverter activity is present.' : 'All battery sources reported recently.' : 'Battery reports unavailable or out of date.');
-  put('battery-freshness', b ? b.activityOnly ? 'Same-inverter activity' : b.older ? 'Recent group activity' : 'Recent reports' : 'Unavailable');
+  put('battery-quality', b ? `Solis inverter SOC · ${socReport(b.socAt, now)}` : 'Battery SOC unavailable.');
+  put('battery-freshness', b ? b.lastKnown ? 'Last-known SOC' : b.future ? 'HA clock ahead' : 'Recent HA report' : 'Unavailable');
   const fill = $('battery-fill'); const height = b ? b.soc * .9 : 0;
   fill.setAttribute('height', height); fill.setAttribute('y', 101 - height);
-  put('flow-battery', b ? `${b.state} · ${power(Math.max(b.charge, b.discharge))}` : 'Unavailable');
+  const active = b && (b.charge !== null || b.discharge !== null) ? Math.max(b.charge, b.discharge) : null;
+  put('flow-battery', b ? `${b.state} · ${power(active)}` : 'Unavailable');
 }
 function energyRender(now) {
   const e = data('energy');
   const sourceMap = { fit: 'fit_pv', pv1: 'hybrid_pv_1', pv2: 'hybrid_pv_2', home: 'household', import: 'grid_import', export: 'grid_export', 'net-grid': 'grid_net', 'calculated-load': 'household_ac_balance' };
   for (const [id, source] of Object.entries(sourceMap)) put(id, power(reading(e?.[source], now).value));
   const received = state.records.energy?.lastSuccess;
-  const current = received && now - received <= 300000;
-  const total = e && current && finite(e.solar_total_w) ? e.solar_total_w : null;
+  const total = received && now - received <= 300000 ? solarEstimate(e, now) : null;
+  const current = finite(total);
   put('solar', power(total)); put('flow-solar', power(total));
   const assumed = Number(e?.solar_assumed_zero_inputs ?? 0);
-  put('solar-quality', !e || !current ? 'Solar data unavailable.' : assumed ? `${assumed} solar ${assumed === 1 ? 'input' : 'inputs'} unavailable · treated as zero by policy.` : e.solar_total_status === 'valid_estimate' ? 'Estimate · FIT AC plus hybrid DC inputs.' : 'Zero fallback · total is not verified.');
+  const olderSolar = Number(e?.solar_older_report_inputs ?? 0);
+  const fitNote = olderSolar ? ' FIT AC has an older report; recent activity is confirmed from the FIT inverter.' : '';
+  put('solar-quality', (!e || !current ? 'Solar data unavailable.' : assumed ? `${assumed} solar ${assumed === 1 ? 'input' : 'inputs'} unavailable · treated as zero by policy.` : ['valid_estimate', 'estimated_with_older_reports'].includes(e.solar_total_status) ? 'Estimate · FIT AC plus hybrid DC inputs.' : 'Zero fallback · total is not verified.') + (current ? fitNote : ''));
   const home = reading(e?.household, now); const net = reading(e?.grid_net, now);
   put('reported-load', e?.household?.entity_id ? power(home.value) : 'Not configured');
   put('home-quality', home.note); put('flow-home', power(home.value));
@@ -36,7 +39,7 @@ function energyRender(now) {
   put('grid-direction', finite(net.value) ? net.value < 0 ? 'Exporting to grid' : net.value > 0 ? 'Importing from grid' : 'Grid balanced' : 'Grid unavailable');
   put('grid-arrow', finite(net.value) ? net.value < 0 ? '→' : net.value > 0 ? '←' : '↔' : '—');
   put('grid-quality', e?.grid_import?.status === 'derived' || e?.grid_export?.status === 'derived' ? 'Directional flow derived from signed net power.' : net.note);
-  put('confidence', !e ? 'Live energy readings unavailable.' : `${assumed ? `${assumed} assumed-zero solar inputs. ` : ''}${batteryView(data('battery'), now)?.older ? 'Battery includes older unchanged reports. ' : ''}Source quality is shown below.`);
+  put('confidence', !e ? 'Live energy readings unavailable.' : `${assumed ? `${assumed} assumed-zero solar inputs. ` : ''}${batteryView(data('battery'), now)?.lastKnown ? 'Battery SOC is last-known. ' : ''}Source quality is shown below.`);
 }
 function drawRates(rates, now) {
   const host = $('price-chart'); host.replaceChildren();
@@ -96,20 +99,39 @@ function forecastsRender(now) {
   const stamps = (f?.forecasts ?? []).map(r => Date.parse(r.source_timestamps?.observed_at)).filter(Number.isFinite);
   put('forecast-quality', stamps.length ? `Oldest source report: ${londonTime(Math.min(...stamps))}. Stale forecasts are excluded.` : 'Forecast source reports unavailable.');
 }
-function diagnosticsRender() {
+const exportPeriods = [['daily', 'Export today'], ['monthly', 'Export this month'], ['yearly', 'Export this year']];
+const exportText = report => report.value === null ? report.note : `${report.value.toFixed(2)} kWh`;
+
+function gridExportRender(now) {
+  const totals = data('grid-export');
+  for (const [period] of exportPeriods) {
+    put(`grid-export-${period}`, exportText(gridExportView(totals?.[period], period, now)));
+  }
+}
+
+function diagnosticsRender(now) {
   const host = $('diagnostics-body'); host.replaceChildren(); const e = data('energy');
   const rows = [['FIT solar', e?.fit_pv], ['Hybrid PV 1', e?.hybrid_pv_1], ['Hybrid PV 2', e?.hybrid_pv_2], ['Household load', e?.household], ['Grid net', e?.grid_net], ['Hybrid AC', e?.hybrid_ac]];
   for (const [key, label] of [['soc_percent', 'Battery state of charge'], ['charge_power_w', 'Battery charge'], ['discharge_power_w', 'Battery discharge']]) { const source = data('battery')?.freshness?.sources?.[key]; rows.push([label, source ? { status: source.status, reading: source } : null]); }
+  const fitActivity = e?.fit_pv?.freshness?.activity_source;
+  if (fitActivity) rows.push(['FIT inverter activity (older AC report)', { status: fitActivity.status, reading: fitActivity }]);
   const activity = data('battery')?.freshness?.activity_source;
   if (activity) rows.push(['Hybrid inverter activity (battery group)', { status: activity.status, reading: activity }]);
-  for (const [label, source] of rows) {
+  const totals = data('grid-export');
+  for (const [period, label] of [...exportPeriods, ['cumulative', 'Cumulative export']]) {
+    const source = period === 'cumulative' ? totals?.diagnostics?.cumulative : totals?.[period];
+    const report = gridExportView(source, period, now);
+    const rowLabel = `Octopus · ${label}`;
+    rows.push([rowLabel, source, period === 'cumulative' ? exportText(report) : report.note]);
+  }
+  for (const [label, source, displayQuality] of rows) {
     const status = source?.status;
     const quality = ({ valid: 'Reported', derived: 'Calculated', fresh: 'Recent report', older_report_accepted_via_group: 'Older report · accepted via group', assumed_zero: `Assumed zero · ${humanStatus(source?.source_status).toLowerCase()}`, estimated_with_assumed_zero: 'Estimate · assumed solar zero', future_within_tolerance: 'Clock ahead · within tolerance' })[status] ?? humanStatus(status);
-    const row = make('tr'); row.append(make('th', label), make('td', quality), make('td', londonTime(source?.reading?.observed_at ?? source?.reading?.observed_from))); row.firstChild.scope = 'row'; host.append(row);
+    const row = make('tr'); row.append(make('th', label), make('td', displayQuality ?? quality), make('td', londonTime(source?.reading?.observed_at ?? source?.reading?.observed_from))); row.firstChild.scope = 'row'; host.append(row);
   }
 }
 function render() {
-  const now = Date.now(); batteryRender(now); energyRender(now); pricesRender(now); forecastsRender(now); diagnosticsRender(); costsRender(now);
+  const now = Date.now(); batteryRender(now); energyRender(now); gridExportRender(now); pricesRender(now); forecastsRender(now); diagnosticsRender(now); costsRender(now);
   const health = data('health'); const healthAge = now - (state.records.health?.lastSuccess ?? 0);
   const online = health?.status === 'healthy' && healthAge <= 120000;
   put('health', online ? 'HEMS Online' : 'Connection unavailable'); put('sidebar-status', online ? 'Service online' : 'Service unavailable');
@@ -190,7 +212,7 @@ async function loadHistory() {
       for (const value of [londonTime(r.sampled_at * 1000), finite(r.value) ? `${r.value.toFixed(1)} ${r.unit ?? ''}` : '—', humanStatus(r.status), londonTime(r.observed_at)]) row.append(make('td', value));
       tbody.append(row);
     }
-    put('history-note', `${rows.length} samples in the last 24 hours · ${status.retention_days} day retention · ${status.sample_interval_seconds}s sampling. ${result.truncated ? 'Result truncated; narrow the API time range. ' : ''}Assumed-zero and unavailable readings leave chart gaps. Calculated readings and battery values accepted through group activity retain their quality labels. Loaded ${londonTime(Date.now())}.`);
+    put('history-note', `${rows.length} samples in the last 24 hours · ${status.retention_days} day retention · ${status.sample_interval_seconds}s sampling. ${result.truncated ? 'Result truncated; narrow the API time range. ' : ''}Assumed-zero and unavailable readings leave chart gaps. Calculated readings and last-known battery SOC retain their quality labels. Loaded ${londonTime(Date.now())}.`);
   } catch {
     $('history-chart').replaceChildren(); $('history-body').replaceChildren();
     put('history-note', 'History could not be loaded. Try again; live readings remain available.');
@@ -243,22 +265,7 @@ async function loadModelling() {
   const response = await fetch('/api/modelling/summary', { signal: controller.signal });
   if (!response.ok) throw new Error('unavailable');
   const m = await response.json(); const host = $('modelling-result'); host.replaceChildren();
-  const num = (v, unit) => typeof v === 'number' && Number.isFinite(v) ? `${v.toFixed(unit === 'W' || unit === '%' ? 0 : 1)} ${unit}` : 'Insufficient data';
-  const b = m.battery;
-  host.append(make('p', `Capacity assumption ${num(b.assumed_usable_kwh, 'kWh')} usable; reserve ${num(b.reserve_percent, '%')}. Above reserve now: ${num(b.above_reserve_kwh, 'kWh')}.`));
-  host.append(make('p', `Observed active charge: ${num(b.charge.median_active_w, 'W')}; discharge: ${num(b.discharge.median_active_w, 'W')}. These are medians, not inverter limits.`));
-  host.append(make('p', b.efficiency_reason));
-  const table = make('table'); table.append(make('caption', 'Demand outlook · Europe/London · descriptive range'));
-  const head = make('thead'); const heading = make('tr'); for (const text of ['Start', 'Demand', 'Range', 'SOC scenario']) { const th = make('th', text); th.scope = 'col'; heading.append(th); } head.append(heading); table.append(head);
-  const body = make('tbody');
-  for (const p of m.predictions) { const row = make('tr'); for (const text of [p.local_start.slice(11, 16) + ' ' + p.local_start.slice(19), num(p.demand_w, 'W'), typeof p.low_w === 'number' ? `${num(p.low_w, 'W')} – ${num(p.high_w, 'W')}` : '—', num(p.soc_scenario_end_percent, '%')]) row.append(make('td', text)); body.append(row); }
-  table.append(body); const wrap = make('div', undefined, 'table-scroll'); wrap.append(table); host.append(wrap);
-  host.append(make('p', m.diagnostics.soc_scenario));
-  const details = make('details'); details.append(make('summary', 'Assumptions, coverage and solar comparisons'));
-  for (const [key, value] of Object.entries(m.diagnostics)) details.append(make('p', `${key.replaceAll('_', ' ')}: ${typeof value === 'object' ? JSON.stringify(value) : value}`));
-  for (const p of m.profiles) details.append(make('p', `${String(p.hour).padStart(2, '0')}:00 · ${p.period} · ${p.occupancy}: ${num(p.median_w, 'W')} median, ${p.days} qualifying days${p.ready ? '' : ' · insufficient days for prediction'}.`));
-  for (const s of m.solar_comparisons) details.append(make('p', `${s.day} · ${s.array} (${s.basis}): forecast ${num(s.forecast?.kwh, 'kWh')}; actual estimate ${num(s.actual_estimate_kwh, 'kWh')}; coverage ${s.coverage_percent}%. First seen: ${s.forecast?.first_seen ?? 'unavailable'}; provider issued: ${s.forecast?.provider_issued_at ?? 'unknown'}.`));
-  details.append(make('p', m.solar_comparisons[0]?.note ?? '')); host.append(details);
+  renderModelling(host, m);
   put('modelling-status', `Saved-history model as of ${londonTime(m.as_of)}. Load again to refresh; results cached for 60 seconds.`);
  } catch { $('modelling-result').replaceChildren(); put('modelling-status', 'Modelling unavailable. Saved history may be busy; try again.'); }
  finally { clearTimeout(timer); button.disabled = false; button.setAttribute('aria-busy', 'false'); }

@@ -27,10 +27,10 @@ test('forecast totals require three distinct valid sources, without stale or mis
   const partial = make(); partial.forecasts.pop(); assert.equal(forecastTotal(partial, 'tomorrow', now), null);
   const repeated = make(); repeated.forecasts[2].entity_id = repeated.forecasts[0].entity_id; assert.equal(forecastTotal(repeated, 'tomorrow', now), null);
 });
-test('battery preserves group acceptance but ages out without a recent report', () => {
-  const data = { soc_percent: 87, charge_power_w: 0, discharge_power_w: 265, freshness: { fetched_at: stamp, sources: { soc: { observed_at: stamp }, charge: { observed_at: new Date(now - 7200000).toISOString() } } } };
+test('battery rejects invalid SOC and expires an old collector response', () => {
+  const data = { soc_percent: 87, charge_power_w: 0, discharge_power_w: 265, freshness: { fetched_at: stamp, sources: { soc_percent: { observed_at: stamp }, discharge_power_w: { observed_at: stamp } } } };
   assert.equal(batteryView(data, now).state, 'Discharging');
-  assert.equal(batteryView(data, now).older, true);
+  assert.equal(batteryView(data, now).lastKnown, false);
   assert.equal(batteryView(data, now + 300001), null);
   assert.equal(batteryView({ ...data, soc_percent: 101 }, now), null);
 });

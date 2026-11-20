@@ -1,5 +1,8 @@
 //! Read-only statistical foundation; no HA calls or model writes.
-use crate::history::History;
+mod daylight;
+mod projection;
+
+use crate::history::{History, MODELLING_SAMPLE_FILTER};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use rusqlite::{Connection, params};
@@ -17,16 +20,17 @@ pub struct Settings {
     base: f64,
     wfh: BTreeSet<u32>,
     dates: BTreeMap<String, String>,
+    projection: projection::Settings,
+}
+fn n(k: &str, d: f64, min: f64, max: f64) -> Result<f64, Error> {
+    let v = std::env::var(k).map_or(Ok(d), |s| s.parse::<f64>())?;
+    if !v.is_finite() || v < min || v > max {
+        return Err(format!("Invalid {k}").into());
+    }
+    Ok(v)
 }
 impl Settings {
     pub fn from_env() -> Result<Self, Error> {
-        fn n(k: &str, d: f64, min: f64, max: f64) -> Result<f64, Error> {
-            let v = std::env::var(k).map_or(Ok(d), |s| s.parse::<f64>())?;
-            if !v.is_finite() || v < min || v > max {
-                return Err(format!("Invalid {k}").into());
-            }
-            Ok(v)
-        }
         let nominal = n("HEMS_MODEL_NOMINAL_KWH", 10.24, 0.1, 1000.)?;
         let wfh = std::env::var("HEMS_MODEL_WFH_DAYS")
             .unwrap_or_default()
@@ -51,6 +55,7 @@ impl Settings {
         }
         Ok(Self {
             dates,
+            projection: projection::Settings::from_env()?,
             nominal,
             usable: n("HEMS_MODEL_USABLE_KWH", 9.728, 0.1, nominal)?,
             reserve: n("HEMS_MODEL_RESERVE_PERCENT", 10., 0., 100.)?,
@@ -83,6 +88,8 @@ impl Settings {
 struct Sample {
     at: i64,
     metric: String,
+    observed: i64,
+    fetched: i64,
     value: f64,
 }
 fn round(v: f64) -> f64 {
@@ -96,52 +103,48 @@ fn percentile(v: &mut [f64], q: f64) -> Option<f64> {
     Some(v[((v.len() - 1) as f64 * q).round() as usize])
 }
 fn load(db: &Connection, now: i64) -> Result<Vec<Sample>, Error> {
+    let mut stmt = db.prepare(&format!(
+        "SELECT sampled_at,metric,value,observed_at,unit,fetched_at
+         FROM samples INDEXED BY samples_modelling
+         WHERE sampled_at BETWEEN ?1 AND ?2 AND {MODELLING_SAMPLE_FILTER}
+         ORDER BY sampled_at LIMIT 400000",
+    ))?;
+    let mut rows = stmt.query(params![now - 28 * 86400, now])?;
     let mut all = Vec::new();
-    for metric in [
-        "household",
-        "soc_percent",
-        "charge_power_w",
-        "discharge_power_w",
-        "fit_pv",
-        "hybrid_pv_1",
-        "hybrid_pv_2",
-    ] {
-        let mut stmt=db.prepare("SELECT sampled_at,value,observed_at,unit,status FROM samples WHERE metric=?1 AND sampled_at>=?2 AND sampled_at<=?3 ORDER BY sampled_at LIMIT 40321")?;
-        let rows = stmt.query_map(params![metric, now - 28 * 86400, now], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<f64>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        for r in rows {
-            let (at, v, obs, unit, status) = r?;
-            let Some(v) = v.filter(|v| v.is_finite() && *v >= 0.) else {
-                continue;
-            };
-            let age = obs
-                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                .map(|t| at - t.timestamp());
-            if !matches!(
-                status.as_str(),
-                "valid" | "fresh" | "derived" | "future_within_tolerance"
-            ) || !age.is_some_and(|a| (-60..=300).contains(&a))
-                || unit.as_deref() != Some(if metric == "soc_percent" { "%" } else { "W" })
-                || (metric == "soc_percent" && v > 100.)
-            {
-                continue;
-            }
-            all.push(Sample {
-                at,
-                metric: metric.into(),
-                value: v,
-            });
+    while let Some(row) = rows.next()? {
+        let at: i64 = row.get(0)?;
+        let metric: String = row.get(1)?;
+        let value: f64 = row.get(2)?;
+        let soc = metric == "soc_percent";
+        if !value.is_finite() || (value < 0. && metric != "grid_net") || (soc && value > 100.) {
+            continue;
         }
+        let unit: Option<String> = row.get(4)?;
+        if unit.as_deref() != Some(if soc { "%" } else { "W" }) {
+            continue;
+        }
+        let observed = row
+            .get::<_, Option<String>>(3)?
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+            .map(|t| t.timestamp());
+        let Some(observed) = observed.filter(|t| (-60..=300).contains(&(at - t))) else {
+            continue;
+        };
+        let fetched = row
+            .get::<_, String>(5)?
+            .parse::<DateTime<Utc>>()
+            .map_or(i64::MAX, |t| t.timestamp());
+        all.push(Sample {
+            at,
+            metric,
+            observed,
+            fetched,
+            value,
+        });
     }
     Ok(all)
 }
+
 fn profiles(samples: &[Sample], cfg: &Settings) -> Value {
     // UTC hours remain separate through DST folds; group means give days equal weight.
     let mut hours: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
@@ -172,16 +175,18 @@ fn profiles(samples: &[Sample], cfg: &Settings) -> Value {
     }
     json!(out)
 }
+#[cfg(test)]
 fn model(samples: &[Sample], cfg: &Settings, now: i64) -> Value {
+    let soc = samples
+        .iter()
+        .rev()
+        .find(|s| s.metric == "soc_percent" && (0..=300).contains(&(now - s.observed)))
+        .map(|s| s.value);
+    model_with_soc(samples, cfg, now, soc)
+}
+
+fn model_with_soc(samples: &[Sample], cfg: &Settings, now: i64, soc: Option<f64>) -> Value {
     let profiles = profiles(samples, cfg);
-    let latest = |metric: &str| {
-        samples
-            .iter()
-            .filter(|s| s.metric == metric && now - s.at <= 300)
-            .max_by_key(|s| s.at)
-            .map(|s| s.value)
-    };
-    let soc = latest("soc_percent");
     let floor = soc.map(|s| s.min(cfg.reserve)).unwrap_or(cfg.reserve);
     let energy = soc.map(|s| cfg.usable * (s - cfg.reserve).max(0.) / 100.);
     let mut e = energy;
@@ -230,13 +235,37 @@ fn model(samples: &[Sample], cfg: &Settings, now: i64) -> Value {
     for sample in samples {
         *counts.entry(sample.metric.clone()).or_insert(0usize) += 1;
     }
-    json!({"as_of":DateTime::from_timestamp(now,0),"timezone":"Europe/London","advisory_only":true,"battery":{"nominal_kwh":cfg.nominal,"assumed_usable_kwh":cfg.usable,"reserve_percent":cfg.reserve,"soc_percent":soc,"stored_kwh":soc.map(|s|round(cfg.usable*s/100.)),"above_reserve_kwh":energy.map(round),"charge":rates("charge_power_w"),"discharge":rates("discharge_power_w"),"measured_efficiency":null,"efficiency_reason":"No independently verified same-boundary energy channels. SOC quantisation and AC/DC mixing prevent measured efficiency claims."},"profiles":profiles,"predictions":predictions,"diagnostics":{"accepted_samples":samples.len(),"accepted_by_metric":counts,"training_days":28,"minimum_days_per_hour":3,"minimum_samples_per_hour":30,"essential_baseload_w":cfg.base,"occupancy_basis":"Explicit date labels override configured WFH weekday schedule; other weekdays unknown. Schedule assumptions also apply to historical dates. No inferred presence or away savings.","uncertainty":"Daily hourly means, descriptive 10th–90th percentiles, not calibrated intervals. Sparse groups withheld.","soc_scenario":"No solar, no charging, lossless unlimited discharge; optimistic demand-only scenario. Reserve is a floor, grid supplies unmet load. Initial partial interval integrated proportionally.","missing_data":"Reject assumed zero, stale, missing units/timestamps, source reports older than 300s. Latest SOC expires after 300s.","assumptions":"Published usable capacity is configurable, not measured. SOC maps linearly to usable capacity; confirm SOC scale and reserve. CCTV/network remain in whole-home demand plus configured essential floor."}})
+    json!({"as_of":DateTime::from_timestamp(now,0),"timezone":"Europe/London","advisory_only":true,"battery":{"nominal_kwh":cfg.nominal,"assumed_usable_kwh":cfg.usable,"reserve_percent":cfg.reserve,"soc_percent":soc,"stored_kwh":soc.map(|s|round(cfg.usable*s/100.)),"above_reserve_kwh":energy.map(round),"charge":rates("charge_power_w"),"discharge":rates("discharge_power_w"),"measured_efficiency":null,"efficiency_reason":"No independently verified same-boundary energy channels. SOC quantisation and AC/DC mixing prevent measured efficiency claims."},"profiles":profiles,"predictions":predictions,"diagnostics":{"accepted_samples":samples.len(),"accepted_by_metric":counts,"training_days":28,"minimum_days_per_hour":3,"minimum_samples_per_hour":30,"essential_baseload_w":cfg.base,"occupancy_basis":"Explicit date labels override configured WFH weekday schedule; other weekdays unknown. Schedule assumptions also apply to historical dates. No inferred presence or away savings.","uncertainty":"Daily hourly means, descriptive 10th–90th percentiles, not calibrated intervals. Sparse groups withheld.","soc_scenario":"Demand-only SOC uses an hourly demand profile split into half-hours, with no solar or charging, no conversion losses and no discharge power limit. Discharge stops at reserve. Grid supplies unmet load. A missing demand interval stops subsequent SOC estimates.","missing_data":"Reject assumed zero, stale, missing units/timestamps, source reports older than 300s. Solis SOC uses the latest collector result with its original Home Assistant timestamp.","assumptions":"Published usable capacity is configurable, not measured. SOC maps linearly to usable capacity; confirm SOC scale and reserve. CCTV/network remain in whole-home demand plus configured essential floor."}})
 }
-fn solar(db: &Connection, samples: &[Sample], now: i64) -> Result<Value, Error> {
+fn solar(
+    db: &Connection,
+    samples: &[Sample],
+    now: i64,
+    site: Option<(f64, f64)>,
+) -> Result<Value, Error> {
     let today = DateTime::from_timestamp(now, 0)
         .unwrap()
         .with_timezone(&chrono_tz::Europe::London)
         .date_naive();
+    let arrays = [
+        ("fit", "fit_pv", "AC output"),
+        ("hybrid_1", "hybrid_pv_1", "DC input NW"),
+        ("hybrid_2", "hybrid_pv_2", "DC input W"),
+    ];
+    let mut series: [Vec<&Sample>; 3] = Default::default();
+    for sample in samples.iter().rev().take_while(|s| s.at >= now - 9 * 86400) {
+        if sample.fetched <= now
+            && let Some(i) = arrays
+                .iter()
+                .position(|&(_, metric, _)| metric == sample.metric)
+        {
+            series[i].push(sample);
+        }
+    }
+    for readings in &mut series {
+        readings.reverse();
+    }
+    let mut stmt = db.prepare("SELECT first_seen,issued_at,payload FROM snapshots WHERE kind='forecasts' AND target_day=?1 AND first_seen<?2 AND substr(source,1,instr(source,':')-1)=?3 ORDER BY first_seen DESC,id DESC LIMIT 1")?;
     let mut out = Vec::new();
     for days in 1..=7 {
         let day = today - chrono::Duration::days(days);
@@ -254,12 +283,14 @@ fn solar(db: &Connection, samples: &[Sample], now: i64) -> Result<Value, Error> 
             .single()
             .unwrap()
             .timestamp();
-        for (array, metric, basis) in [
-            ("fit", "fit_pv", "AC output"),
-            ("hybrid_1", "hybrid_pv_1", "DC input NW"),
-            ("hybrid_2", "hybrid_pv_2", "DC input W"),
-        ] {
-            let mut stmt=db.prepare("SELECT first_seen,issued_at,payload FROM snapshots WHERE kind='forecasts' AND target_day=?1 AND first_seen<?2 AND substr(source,1,instr(source,':')-1)=?3 ORDER BY first_seen DESC,id DESC LIMIT 1")?;
+        let windows = daylight::relevant_windows(start..end, site);
+        let relevant: i64 = windows.iter().map(|w| w.end - w.start).sum();
+        let coverage_basis = match (site, relevant) {
+            (None, _) => "full_day",
+            (_, 0) => "no_daylight",
+            _ => "daylight_and_twilight",
+        };
+        for ((array, _, basis), readings) in arrays.into_iter().zip(&series) {
             let mut rows = stmt.query(params![day.to_string(), start, array])?;
             let forecast = if let Some(r) = rows.next()? {
                 let seen: i64 = r.get(0)?;
@@ -269,32 +300,103 @@ fn solar(db: &Connection, samples: &[Sample], now: i64) -> Result<Value, Error> 
             } else {
                 Value::Null
             };
-            let s: Vec<_> = samples
-                .iter()
-                .filter(|s| s.metric == metric && s.at >= start && s.at < end)
-                .collect();
-            let (mut energy, mut covered) = (0., 0i64);
-            for pair in s.windows(2) {
-                let dt = pair[1].at - pair[0].at;
-                if dt > 0 && dt <= 120 {
-                    energy += (pair[0].value + pair[1].value) / 2. * dt as f64 / 3_600_000.;
-                    covered += dt;
-                }
-            }
-            let coverage = covered as f64 / (end - start) as f64;
-            let actual = if coverage >= 0.95 {
-                Some(round(energy))
-            } else {
-                None
-            };
+            let (energy, covered) = solar_energy(readings, &windows);
+            let coverage = (relevant > 0).then(|| covered as f64 / relevant as f64);
+            let actual = coverage.filter(|&covered| covered >= 0.95).map(|_| energy);
             let predicted = forecast["kwh"]
                 .as_f64()
                 .filter(|v| v.is_finite() && *v >= 0.);
-            out.push(json!({"day":day.to_string(),"array":array,"basis":basis,"forecast":forecast,"coverage_percent":round(coverage*100.),"actual_estimate_kwh":actual,"error_actual_minus_forecast_kwh":actual.zip(predicted).map(|(a,f)|round(a-f)),"note":"Pre-local-midnight first-seen forecast only; provider issuance may be unknown. Power integration requires 95% full-day coverage with gaps <=120s. AC/DC basis differs; no combined battery charging inference."}));
+            out.push(json!({
+                "day": day.to_string(), "array": array, "basis": basis, "forecast": forecast,
+                "coverage_basis": coverage_basis, "coverage_percent": coverage.map(|c| (c * 1000.).floor() / 10.),
+                "covered_seconds": covered, "relevant_seconds": relevant,
+                "actual_estimate_kwh": actual.map(round),
+                "error_actual_minus_forecast_kwh": actual.zip(predicted).map(|(a, f)| round(a - f)),
+                "note": "Actuals integrate accepted power readings up to two minutes apart and require 95% coverage of daylight including civil twilight. Uncovered time is not extrapolated. With no site coordinates, coverage uses the full local day. With no daylight, measured actuals and forecast errors are withheld. Forecasts use snapshots seen before London midnight; provider issuance may be unknown. Compare each array on its own AC or DC basis.",
+            }));
         }
     }
     Ok(json!(out))
 }
+fn solar_energy(readings: &[&Sample], windows: &[std::ops::Range<i64>]) -> (f64, i64) {
+    let (mut energy, mut covered) = (0., 0);
+    for window in windows {
+        let first = readings
+            .partition_point(|s| s.at < window.start)
+            .saturating_sub(1);
+        let last = (readings.partition_point(|s| s.at < window.end) + 1).min(readings.len());
+        for pair in readings[first..last].windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let dt = b.at - a.at;
+            let start = a.at.max(window.start);
+            let end = b.at.min(window.end);
+            if !(1..=120).contains(&dt) || end <= start {
+                continue;
+            }
+            let watts_at = |at| a.value + (b.value - a.value) * (at - a.at) as f64 / dt as f64;
+            energy += (watts_at(start) + watts_at(end)) / 2. * (end - start) as f64 / 3_600_000.;
+            covered += end - start;
+        }
+    }
+    (energy, covered)
+}
+
+// Read the newest collector result, including invalid rows, so an explicit
+// unavailable state cannot be hidden by an earlier numeric report.
+fn latest_inverter_soc(db: &Connection, now: i64, max_poll_age: i64) -> Result<Value, Error> {
+    let mut stmt = db.prepare(
+        "SELECT value, unit, status, fetched_at, observed_at, provenance FROM samples
+         WHERE metric = 'soc_percent' AND sampled_at BETWEEN ?1 AND ?2
+         ORDER BY sampled_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![now - 2 * max_poll_age, now])?;
+    let Some(row) = rows.next()? else {
+        return Ok(json!({"status":"collector_stale"}));
+    };
+    let fetched: String = row.get(3)?;
+    let observed: Option<String> = row.get(4)?;
+    let timestamp = |s: &str| s.parse::<DateTime<Utc>>().ok().map(|t| t.timestamp());
+    let Some(fetched_at) = timestamp(&fetched).filter(|t| (0..=max_poll_age).contains(&(now - t)))
+    else {
+        return Ok(json!({"status":"collector_stale"}));
+    };
+    let status: String = row.get(2)?;
+    let value: Option<f64> = row.get(0)?;
+    let unit: Option<String> = row.get(1)?;
+    let Some(value) = value.filter(|v| {
+        (0.0..=100.0).contains(v)
+            && unit.as_deref() == Some("%")
+            && matches!(
+                status.as_str(),
+                "fresh"
+                    | "last_known"
+                    | "older_report_accepted_via_group"
+                    | "future_within_tolerance"
+            )
+    }) else {
+        return Ok(json!({"status":status,"fetched_at":fetched}));
+    };
+    let Some(observed_at) = observed
+        .as_deref()
+        .and_then(timestamp)
+        .filter(|t| *t <= fetched_at + 30)
+    else {
+        return Ok(json!({"status":"invalid_timestamp","fetched_at":fetched}));
+    };
+    let age = now - observed_at;
+    let provenance =
+        serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or(Value::Null);
+    Ok(json!({
+        "value":value,"entity_id":crate::home_assistant::BATTERY_IDS[0],
+        "status":if age > 300 {"last_known"} else if age < 0 {"future_within_tolerance"} else {"recent_ha_report"},
+        "observed_at":observed,"age_seconds":age,"fetched_at":fetched,
+        "observed_at_source":provenance["reading"]["observed_at_source"],
+        "last_changed":provenance["reading"]["last_changed"],
+        "last_updated":provenance["reading"]["last_updated"],
+        "last_reported":provenance["reading"]["last_reported"],
+    }))
+}
+
 #[derive(Clone)]
 struct ModelState {
     history: History,
@@ -316,12 +418,15 @@ async fn summary(State(s): State<ModelState>) -> Result<Json<Value>, (StatusCode
         return Ok(Json(v.clone()));
     }
     let cfg = s.cfg.clone();
+    let max_poll_age = (2 * s.history.config.interval as i64).max(300);
     let value = s
         .history
         .run(move |db| {
             let samples = load(db, now)?;
-            let mut v = model(&samples, &cfg, now);
-            v["solar_comparisons"] = solar(db, &samples, now)?;
+            let soc = latest_inverter_soc(db, now, max_poll_age)?;
+            let mut v = model_with_soc(&samples, &cfg, now, soc["value"].as_f64());
+            v["projection"] = projection::calculate(&samples, &cfg, now, &soc);
+            v["solar_comparisons"] = solar(db, &samples, now, cfg.projection.site)?;
             Ok(v)
         })
         .await
@@ -347,8 +452,9 @@ pub fn router(history: History, cfg: Settings) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn cfg() -> Settings {
+    pub(super) fn cfg() -> Settings {
         Settings {
+            projection: projection::Settings::default(),
             nominal: 10.24,
             usable: 9.728,
             reserve: 10.,
@@ -360,6 +466,64 @@ mod tests {
     fn ts(s: &str) -> i64 {
         s.parse::<DateTime<Utc>>().unwrap().timestamp()
     }
+    #[tokio::test]
+    async fn current_collector_result_keeps_old_soc_and_latest_invalid_state_wins() {
+        let history = History::open(crate::history::HistoryConfig {
+            path: ":memory:".into(),
+            interval: 60,
+            days: 30,
+        })
+        .unwrap();
+        let now = Utc::now().timestamp().div_euclid(60) * 60;
+        let fetched = DateTime::from_timestamp(now, 0).unwrap();
+        let old = fetched - chrono::Duration::hours(12);
+        history.record("battery", json!({
+            "soc_percent":98.,
+            "freshness":{"fetched_at":fetched,"sources":{"soc_percent":{
+                "status":"last_known","observed_at":old,"last_updated":old,"observed_at_source":"last_updated"
+            }}}
+        }), fetched).await.unwrap();
+        history
+            .run(move |db| {
+                let source = latest_inverter_soc(db, now, 300)?;
+                assert_eq!(source["value"], 98.);
+                assert_eq!(source["status"], "last_known");
+                assert_eq!(source["age_seconds"], 43200);
+                assert_eq!(source["observed_at_source"], "last_updated");
+                assert_eq!(source["observed_at"], json!(old));
+                let projection = projection::calculate(&[], &cfg(), now + 5, &source);
+                assert_eq!(projection["initial_soc_percent"], 98.);
+                assert_eq!(projection["available_intervals"], 49);
+                assert_eq!(
+                    latest_inverter_soc(db, now + 301, 300)?["status"],
+                    "collector_stale"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let later = fetched + chrono::Duration::minutes(1);
+        history
+            .record(
+                "battery",
+                json!({"freshness":{"fetched_at":later,"sources":{
+                    "soc_percent":{"status":"invalid_state"}
+                }}}),
+                later,
+            )
+            .await
+            .unwrap();
+        history
+            .run(move |db| {
+                let source = latest_inverter_soc(db, now + 60, 300)?;
+                assert_eq!(source["status"], "invalid_state");
+                assert!(source["value"].is_null());
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn sparse_and_stale_soc_withhold_estimates() {
         let now = ts("2026-10-30T12:00:00Z");
@@ -368,6 +532,8 @@ mod tests {
         assert!(v["predictions"][0]["demand_w"].is_null());
         let s = Sample {
             at: now - 301,
+            observed: now - 301,
+            fetched: now - 301,
             metric: "soc_percent".into(),
             value: 60.,
         };
@@ -388,6 +554,8 @@ mod tests {
             for m in 0..60 {
                 s.push(Sample {
                     at: at + m * 60,
+                    observed: at + m * 60,
+                    fetched: at + m * 60,
                     metric: "household".into(),
                     value: w,
                 });
@@ -429,9 +597,9 @@ mod tests {
         let now = ts("2026-10-30T12:00:00Z");
         h.run(move|db|{
  for(metric,status,obs,unit)in[("soc_percent","fresh",now,"%"),("household","valid",now-400,"W"),("fit_pv","assumed_zero",now,"W"),("hybrid_pv_1","valid",now,"kWh")]{db.execute("INSERT INTO samples VALUES (?1,?2,?3,?3,50,?4,?5,'{}')",params![now,metric,DateTime::from_timestamp(obs,0).unwrap().to_rfc3339(),unit,status])?;}
- let s=load(db,now)?;assert_eq!(s.len(),1);let v=model(&s,&cfg(),now);assert_eq!(v["battery"]["soc_percent"],50.);assert!(v["battery"]["measured_efficiency"].is_null());let comparisons=solar(db,&s,now)?;assert_eq!(comparisons.as_array().unwrap().len(),21);assert!(comparisons[0]["actual_estimate_kwh"].is_null());
+ let s=load(db,now)?;assert_eq!(s.len(),1);let v=model(&s,&cfg(),now);assert_eq!(v["battery"]["soc_percent"],50.);assert!(v["battery"]["measured_efficiency"].is_null());let comparisons=solar(db,&s,now,None)?;assert_eq!(comparisons.as_array().unwrap().len(),21);assert!(comparisons[0]["actual_estimate_kwh"].is_null());
  let before=ts("2026-10-28T20:00:00Z");for(seen,value)in[(before,3.),(now,9.)]{let p=json!({"status":"valid","reading":{"value":value,"unit":"kWh"}});db.execute("INSERT INTO snapshots(kind,source,target_day,first_seen,fetched_at,status,identity,payload) VALUES ('forecasts','fit:tomorrow:test','2026-10-29',?1,'fixture','valid',?2,?2)",params![seen,p.to_string()])?;}
- let v=solar(db,&s,now)?;assert_eq!(v[0]["forecast"]["kwh"],3.);assert!(v[0]["forecast"]["provider_issued_at"].is_null());Ok(())}).await.unwrap();
+ let v=solar(db,&s,now,None)?;assert_eq!(v[0]["forecast"]["kwh"],3.);assert!(v[0]["forecast"]["provider_issued_at"].is_null());Ok(())}).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/summary", listener.local_addr().unwrap());
         let task =
@@ -440,6 +608,8 @@ mod tests {
         let a: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
         let b: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert_eq!(a, b);
+        assert_eq!(a["projection"]["status"], "unavailable");
+        assert_eq!(a["projection"]["backtest"].as_array().unwrap().len(), 3);
         assert_eq!(
             client.post(&url).send().await.unwrap().status(),
             StatusCode::METHOD_NOT_ALLOWED
@@ -468,12 +638,14 @@ mod coverage_tests {
                 .step_by(60)
                 .map(|at| Sample {
                     at,
+                    observed: at,
+                    fetched: at,
                     metric: "fit_pv".into(),
                     value: 1000.,
                 })
                 .collect();
             let now = end + 12 * 3600;
-            let rows = solar(&db, &s, now).unwrap();
+            let rows = solar(&db, &s, now, None).unwrap();
             assert_eq!(rows[0]["day"], date);
             assert_eq!(rows[0]["actual_estimate_kwh"], hours as f64);
             assert!(rows[1]["actual_estimate_kwh"].is_null());
@@ -481,12 +653,85 @@ mod coverage_tests {
                 .into_iter()
                 .filter(|s| s.at < start + 3600 || s.at > start + 10800)
                 .collect();
-            assert!(solar(&db, &sparse, now).unwrap()[0]["actual_estimate_kwh"].is_null());
+            assert!(solar(&db, &sparse, now, None).unwrap()[0]["actual_estimate_kwh"].is_null());
         }
     }
     #[test]
+    fn daylight_comparisons_require_measured_coverage_per_array() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE snapshots(first_seen INTEGER,issued_at TEXT,payload TEXT,kind TEXT,target_day TEXT,source TEXT,id INTEGER)").unwrap();
+        let start = "2026-11-15T00:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap()
+            .timestamp();
+        let end = start + 86400;
+        let site = Some((51.5, -0.1));
+        let windows = daylight::relevant_windows(start..end, site);
+        let w = &windows[0];
+        assert!(w.start > start && w.end < end);
+        let mut samples = Vec::new();
+        for at in (w.start..=w.end).step_by(60) {
+            for (metric, value) in [("fit_pv", 1000.), ("hybrid_pv_1", 0.)] {
+                samples.push(Sample {
+                    at,
+                    observed: at,
+                    fetched: at,
+                    value,
+                    metric: metric.into(),
+                });
+            }
+        }
+        let now = end + 1;
+        let rows = solar(&db, &samples, now, site).unwrap();
+        assert_eq!(rows[0]["coverage_basis"], "daylight_and_twilight");
+        assert_eq!(rows[0]["coverage_percent"], 100.);
+        assert_eq!(
+            rows[0]["actual_estimate_kwh"],
+            round((w.end - w.start) as f64 / 3600.)
+        );
+        assert_eq!(rows[1]["actual_estimate_kwh"], 0.);
+        assert_eq!(rows[1]["basis"], "DC input NW");
+        assert_eq!(rows[2]["coverage_percent"], 0.);
+        assert!(rows[2]["actual_estimate_kwh"].is_null());
+
+        let fallback = solar(&db, &samples, now, None).unwrap();
+        assert_eq!(fallback[0]["coverage_basis"], "full_day");
+        assert_eq!(fallback[0]["relevant_seconds"], 86400);
+        assert!(fallback[0]["actual_estimate_kwh"].is_null());
+
+        samples.retain(|s| s.metric != "fit_pv" || s.at >= w.start + 3600);
+        let partial = solar(&db, &samples, now, site).unwrap();
+        assert!(partial[0]["coverage_percent"].as_f64().unwrap() < 95.);
+        assert!(partial[0]["actual_estimate_kwh"].is_null());
+        let polar = solar(&db, &[], now, Some((90., 0.))).unwrap();
+        assert_eq!(polar[0]["coverage_basis"], "no_daylight");
+        assert!(polar[0]["coverage_percent"].is_null());
+        assert!(polar[0]["actual_estimate_kwh"].is_null());
+    }
+
+    #[test]
+    fn solar_integration_clips_a_ramp_and_skips_long_gaps() {
+        let readings: Vec<_> = [(0, 0.), (60, 1200.), (181, 1200.)]
+            .into_iter()
+            .map(|(at, value)| Sample {
+                at,
+                observed: at,
+                fetched: at,
+                value,
+                metric: "fit_pv".into(),
+            })
+            .collect();
+        let refs: Vec<_> = readings.iter().collect();
+        let windows = std::iter::once(30..180).collect::<Vec<_>>();
+        let (energy, covered) = solar_energy(&refs, &windows);
+        assert_eq!(covered, 30);
+        assert_eq!(energy, 900. * 30. / 3_600_000.);
+    }
+
+    #[test]
     fn date_labels_override_schedule_and_below_reserve_never_increases_soc() {
         let mut cfg = Settings {
+            projection: projection::Settings::default(),
             nominal: 10.24,
             usable: 9.728,
             reserve: 10.,
@@ -505,6 +750,8 @@ mod coverage_tests {
         cfg.dates.clear();
         let mut samples = vec![Sample {
             at: now,
+            observed: now,
+            fetched: now,
             metric: "soc_percent".into(),
             value: 5.,
         }];
@@ -516,6 +763,8 @@ mod coverage_tests {
             for m in 0..60 {
                 samples.push(Sample {
                     at: at + m * 60,
+                    observed: at + m * 60,
+                    fetched: at + m * 60,
                     metric: "household".into(),
                     value: 500.,
                 });

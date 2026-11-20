@@ -3,9 +3,10 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 const root = new URL('../', import.meta.url);
 const read = path => readFile(new URL(path, root), 'utf8');
-const model = await read('src/model.mjs');
-const app = (await read('src/app.mjs')).replace(/^import .* from '\.\/model\.mjs';\n/m, '');
-const js = `/* Built by frontend/scripts/build.mjs; edit frontend/src instead. */\n${model}\n${app}`;
+const modules = ['model', 'modelling', 'app'];
+const sources = await Promise.all(modules.map(name => read(`src/${name}.mjs`)));
+const js = '/* Built by frontend/scripts/build.mjs; edit frontend/src instead. */\n'
+  + sources.map(source => source.replace(/^import .* from '\.\/.*\.mjs';\n/gm, '')).join('\n');
 const css = await read('src/styles.css');
 const hash = createHash('sha256').update(js + css).digest('hex').slice(0, 12);
 const html = (await read('src/index.html')).replaceAll('__BUILD__', hash);

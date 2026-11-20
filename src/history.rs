@@ -100,6 +100,12 @@ impl History {
             } tx.commit()?; Ok(()) }).await
     }
 }
+pub(crate) const MODELLING_SAMPLE_FILTER: &str = "
+    metric IN ('household','household_ac_balance','grid_net','soc_percent',
+               'charge_power_w','discharge_power_w','fit_pv','hybrid_pv_1','hybrid_pv_2')
+    AND value IS NOT NULL
+    AND status IN ('valid','fresh','derived','future_within_tolerance')";
+
 fn migrate(db: &mut Connection) -> Result<(), Error> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > 1 {
@@ -130,6 +136,13 @@ fn migrate(db: &mut Connection) -> Result<(), Error> {
             PRAGMA user_version=1;")?;
         tx.commit()?;
     }
+    // This additive index leaves the table format readable by v0.2. Keep
+    // large provenance payloads out of the repeated modelling scan.
+    db.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS samples_modelling
+         ON samples(sampled_at, metric, value, observed_at, unit, fetched_at)
+         WHERE {MODELLING_SAMPLE_FILTER}"
+    ))?;
     Ok(())
 }
 fn sample(
@@ -155,6 +168,7 @@ fn sample(
             | "delayed_period"
             | "assumed_zero"
             | "fresh"
+            | "last_known"
             | "older_report_accepted_via_group"
             | "future_within_tolerance"
     ) {
