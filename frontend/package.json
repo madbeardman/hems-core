@@ -1,1 +1,1 @@
-{"name":"hems-core-dashboard","version":"0.3.3","private":true,"type":"module","scripts":{"build":"node scripts/build.mjs","test":"node --test test/*.test.mjs","check":"node --check src/app.mjs && node --check src/model.mjs && node --check src/modelling.mjs"},"engines":{"node":">=18"}}
+{"name":"hems-core-dashboard","version":"0.4.2","private":true,"type":"module","scripts":{"build":"node scripts/build.mjs","test":"node --test test/*.test.mjs","check":"node --check src/app.mjs && node --check src/model.mjs && node --check src/modelling.mjs"},"engines":{"node":">=18"}}

@@ -1,3 +1,6 @@
+pub(crate) const EXPORT_CALIBRATION: &str = "number.solis_s6_eh1p_export_calibration";
+pub(crate) const EXPORT_OVERRIDE: &str = "input_boolean.hems_export_calibration_override";
+
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -13,6 +16,12 @@ pub struct EntityState {
     pub last_reported: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub attributes: serde_json::Value,
+}
+
+impl EntityState {
+    pub(crate) fn is_unavailable(&self) -> bool {
+        self.state == "unavailable"
+    }
 }
 
 #[derive(Clone)]
@@ -244,6 +253,10 @@ impl HomeAssistantClient {
         {
             return Err("Invalid entity ID".into());
         }
+        self.fetch_state(id).await
+    }
+
+    async fn fetch_state(&self, id: &str) -> Result<EntityState, ReadError> {
         Ok(self
             .client
             .get(format!("{}/api/states/{}", self.base_url, id))
@@ -253,6 +266,55 @@ impl HomeAssistantClient {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    pub(crate) async fn calibration_state(&self) -> Result<EntityState, ReadError> {
+        self.fetch_state(EXPORT_CALIBRATION).await
+    }
+
+    pub(crate) async fn calibration_override_off(&self) -> Result<bool, ReadError> {
+        Ok(self.fetch_state(EXPORT_OVERRIDE).await?.state == "off")
+    }
+
+    pub(crate) async fn set_export_calibration(&self, value: u8) -> Result<(), ReadError> {
+        self.calibration_action(
+            "number/set_value",
+            serde_json::json!({
+                "entity_id": EXPORT_CALIBRATION, "value": value
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn notify_export_calibration(&self, message: &str) -> Result<(), ReadError> {
+        self.calibration_action(
+            "persistent_notification/create",
+            serde_json::json!({
+                "notification_id": "hems_export_calibration",
+                "title": "HEMS Solis export calibration",
+                "message": message,
+            }),
+        )
+        .await
+    }
+
+    async fn calibration_action(
+        &self,
+        action: &str,
+        data: serde_json::Value,
+    ) -> Result<(), ReadError> {
+        let response = self
+            .client
+            .post(format!("{}/api/services/{}", self.base_url, action))
+            .bearer_auth(&self.token)
+            .json(&data)
+            .send()
+            .await?
+            .error_for_status()?;
+        if !response.status().is_success() {
+            return Err("Unexpected Home Assistant service response".into());
+        }
+        Ok(())
     }
 }
 

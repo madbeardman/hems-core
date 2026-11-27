@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod costs;
+mod export_calibration;
 mod frontend;
 mod history;
 mod home_assistant;
@@ -29,10 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history =
         history::History::open(history::HistoryConfig::from_env().map_err(|e| e.to_string())?)
             .map_err(|_| "Unable to open/migrate history database")?;
+    let calibration_mode = export_calibration::Mode::from_env()?;
+    let calibration_state = state.clone();
     let costs = costs::CostsState::from_env(state.ha.clone())?;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let cost_collector = costs::start(costs.clone(), history.clone(), stop_rx.clone());
-    let collector = history::start(history.clone(), state.clone(), stop_rx);
+    let collector = history::start(history.clone(), state.clone(), stop_rx.clone());
     let app = Router::new()
         .nest(
             "/api/modelling",
@@ -49,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&address).await?;
 
+    let calibration = export_calibration::start(calibration_mode, calibration_state, stop_rx);
+
     println!(
         "HEMS-Core v{} listening on http://{}",
         env!("CARGO_PKG_VERSION"),
@@ -63,6 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     collector.await?;
     cost_collector.await?;
+    if let Some(calibration) = calibration {
+        calibration.await?;
+    }
 
     Ok(())
 }

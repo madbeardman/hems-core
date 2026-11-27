@@ -285,6 +285,75 @@ fn solar_total(pv: &[(f64, chrono::DateTime<chrono::Utc>)], confirmed: bool) -> 
     if sum.is_finite() { Some(sum) } else { None }
 }
 
+// Read explicit HA states directly, without dashboard estimates or activity witnesses.
+pub(crate) async fn control_solar(
+    state: &AppState,
+) -> Result<(f64, [chrono::DateTime<chrono::Utc>; 3], bool), &'static str> {
+    let ids = ["fit_pv", "hybrid_pv_1", "hybrid_pv_2"].map(|name| {
+        state
+            .collection
+            .sources
+            .get(name)
+            .map_or("", String::as_str)
+    });
+    let [fit, pv1, pv2] = ids;
+    if !state.collection.pv_confirmed
+        || ids.contains(&"")
+        || fit == pv1
+        || fit == pv2
+        || pv1 == pv2
+        || ids.contains(&"sensor.solis_s6_eh1p_active_power")
+    {
+        return Err("unconfirmed_or_duplicate_pv_mapping");
+    }
+    let default_fit = fit == FIT_POWER_ENTITY;
+    let (fit, pv1, pv2) = tokio::try_join!(
+        state.ha.entity(fit),
+        state.ha.entity(pv1),
+        state.ha.entity(pv2)
+    )
+    .map_err(|e| crate::home_assistant::diagnostic_status(e.as_ref()))?;
+    let now = chrono::Utc::now();
+    let mut readings = [(0.0, now); 3];
+    let fit_asleep = default_fit && fit.is_unavailable();
+    if fit_asleep {
+        let observed = fit.last_reported.unwrap_or(fit.last_updated);
+        if fit.last_changed > fit.last_updated || fit.last_updated > observed || observed > now {
+            return Err("invalid_fit_unavailable_timestamp");
+        }
+        readings[0] = (0.0, observed);
+    }
+    for (entity, sample) in [&fit, &pv1, &pv2]
+        .into_iter()
+        .zip(&mut readings)
+        .skip(usize::from(fit_asleep))
+    {
+        let mut reading = crate::home_assistant::validate_with_age(entity, now, None)
+            .map_err(|e| crate::home_assistant::diagnostic_status(e.as_ref()))?;
+        if reading.observed_at > now {
+            return Err("future_timestamp");
+        }
+        normalize(&mut reading, "W", false)?;
+        *sample = (reading.value, reading.observed_at);
+    }
+    let reports = readings.map(|(_, at)| at);
+    // Inverters may stop publishing unchanged zero readings as they go idle.
+    if readings.iter().all(|(watts, _)| *watts == 0.0) {
+        return Ok((0.0, reports, fit_asleep));
+    }
+    if fit_asleep {
+        return Err("fit_unavailable_with_nonzero_hybrid_pv");
+    }
+    if reports
+        .iter()
+        .any(|at| now - *at > chrono::Duration::seconds(300))
+    {
+        return Err("stale");
+    }
+    let total = solar_total(&readings, true).ok_or("invalid_or_misaligned_solar_total")?;
+    Ok((total, reports, false))
+}
+
 fn derive_stale_grid_directions(result: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(net) = result
         .get("grid_net")
